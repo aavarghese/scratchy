@@ -3,4 +3,10 @@
 # markdown rendering is client-side (zero-md), so there is no mdBook step.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec python3 "$here/build.py"
+root="$(dirname "$here")"
+
+python3 "$here/build.py"
+
+# Generated straight from the DSL sources, so the architectures page cannot
+# drift from what the compiler actually reads.
+python3 "$here/build-archs.py" "$root" "$here/_site/architectures.html"
