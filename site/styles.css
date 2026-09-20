@@ -19,6 +19,56 @@
   --wide: 1080px;
 }
 
+/* Compatibility aliases for site/build-archs.py's architectures page, which
+ * predates this file's --cds-* rewrite and names Carbon tokens the way an
+ * earlier revision of this file did. Aliased to the same real --cds-*
+ * custom properties everything else here uses, never re-hand-picked hex. */
+:root {
+  --background: var(--cds-background);
+  --background-hover: var(--cds-background-hover);
+  --layer-01: var(--cds-layer-01);
+  --layer-02: var(--cds-layer-02);
+  --layer-hover-01: var(--cds-layer-hover-01);
+  --layer-hover-02: var(--cds-layer-hover-02);
+  --border-subtle: var(--cds-border-subtle);
+  --border-strong: var(--cds-border-strong);
+  --text-primary: var(--cds-text-primary);
+  --text-secondary: var(--cds-text-secondary);
+  --text-helper: var(--cds-text-helper);
+  --link-primary: var(--cds-link-primary);
+  --link-primary-hover: var(--cds-link-primary-hover);
+  --border-interactive: var(--cds-border-interactive);
+  --focus: var(--cds-focus);
+  --spacing-01: var(--cds-spacing-01);
+  --spacing-02: var(--cds-spacing-02);
+  --spacing-03: var(--cds-spacing-03);
+  --spacing-04: var(--cds-spacing-04);
+  --spacing-05: var(--cds-spacing-05);
+  --spacing-06: var(--cds-spacing-06);
+  --spacing-07: var(--cds-spacing-07);
+  --spacing-08: var(--cds-spacing-08);
+  --spacing-09: var(--cds-spacing-09);
+  --spacing-10: var(--cds-spacing-10);
+  --spacing-11: var(--cds-spacing-11);
+  --spacing-12: var(--cds-spacing-12);
+  --spacing-13: var(--cds-spacing-13);
+}
+
+/* A minimal shim for the one plain <button class="btn"> left (the compare-
+ * swap control on the architectures page) — everything else uses the real
+ * cds-button component. */
+.btn {
+  display: inline-block;
+  padding: var(--spacing-03) var(--spacing-05);
+  border-radius: 0;
+  border: 1px solid var(--border-strong);
+  background: var(--layer-01);
+  color: var(--text-primary);
+  font-weight: 600;
+  cursor: pointer;
+}
+.btn:hover { background: var(--layer-hover-01); }
+
 * { box-sizing: border-box; }
 
 /* Carbon custom elements render unstyled/unboxed until their module has
