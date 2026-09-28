@@ -220,6 +220,8 @@ impl std::error::Error for WorkerError {}
 /// references threaded through `new`.
 pub struct MetalWorker<W: CanonicalParams> {
     pub arena: Vec<Buffer>,
+    /// Residency pins for every buffer the baked dispatches reach by address.
+    _pins: Vec<crate::residency::Pinned>,
     pub bucket_bakings: Vec<BucketBaking>,
     /// Shared SplitK scratch buffer. `Some` when any bucket tape
     /// requested a non-zero `splitk_scratch_bytes` (i.e. at least one
@@ -248,18 +250,23 @@ pub struct MetalWorker<W: CanonicalParams> {
     /// attention was lowered.
     pub attn_unfused_scratch: Option<Buffer>,
     /// TurboQuant KV cache active for this worker (set from `runtime.tq` at
-    /// build). Gates the `OnlyIfTurboquant` per-layer dequant/quantize commands.
+    /// build). Gates the TurboQuant per-layer commands (`gate_matches`).
     pub turboquant: bool,
     /// Per-forward block-table ROW WIDTH (== the host's `max_blocks_eff`
-    /// stride) for the TurboQuant full-context dequant grid. Stashed from
+    /// stride) for the TurboQuant full-context staging grid. Stashed from
     /// `inputs.block_tables` before each forward (see the `write_runtime_inputs`
-    /// call sites in `pool.rs`). The `TqDequantToScratch` dispatch reads this
-    /// for `grid.x` so the dequant covers the WHOLE active context. Using the
+    /// call sites in `pool.rs`). The `TqStageRotated` dispatch reads this
+    /// for `grid.x` so the staging covers the WHOLE active context. Using the
     /// static `W::MAX_BLOCKS_PER_SEQ` instead (128 for uniform arches) truncated
-    /// the dequant at 128 blocks / 2048 tokens, leaving the reused fp16 scratch
+    /// it at 128 blocks / 2048 tokens, leaving the reused fp16 scratch
     /// tail holding the previous layer's KV → `!!!!` collapse past 2048 tokens.
     /// `0` until the first forward sets it (dispatch falls back to the const).
     pub tq_dequant_max_blocks: std::sync::atomic::AtomicU32,
+    /// Whether some sequence of the step about to run has an unrotated
+    /// (bit-31, span) block in its block table, set with
+    /// `tq_dequant_max_blocks`. Only a prefill attention that re-ropes K can
+    /// read such a block (`RuntimeGate::OnlyIfUnrotatedBlocks`).
+    pub unrotated_blocks: std::sync::atomic::AtomicBool,
     _marker: std::marker::PhantomData<fn() -> W>,
 }
 
@@ -327,6 +334,11 @@ impl<W: CanonicalParams> MetalWorker<W> {
             });
         }
 
+        // Every buffer the baked dispatches reach by address, pinned for as
+        // long as this worker lives.
+        let mut pins: Vec<crate::residency::Pinned> = Vec::new();
+        let mut pin = |b: &Buffer| pins.extend(residency.map(|r| r.pin(b.clone())));
+
         let arena: Vec<Buffer> = arena_layout
             .iter()
             .map(|&size| {
@@ -340,115 +352,44 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         MTLResourceOptions::StorageModeShared,
                     )
                     .expect("newBufferWithLength_options returned nil");
-                if let Some(r) = residency {
-                    r.insert(&buf);
-                }
+                pin(&buf);
                 buf
             })
             .collect();
 
-        // Shared SplitK scratch buffer sized to the max across all
-        // bucket tapes — one buffer suffices because successive
-        // `affine_qmm_t_splitk` / `splitk_reduce_sum` pairs run
-        // serially inside a single encoder. Allocated only when at
-        // least one tape requested non-zero scratch; bakings that
-        // don't reference `Binding::Scratch` pay nothing.
-        let max_splitk_scratch_bytes: u32 = bucket_tapes
-            .iter()
-            .map(|t| t.splitk_scratch_bytes)
-            .max()
-            .unwrap_or(0);
-        let splitk_scratch: Option<Buffer> = if max_splitk_scratch_bytes > 0 {
-            let buf = device
-                .newBufferWithLength_options(
-                    max_splitk_scratch_bytes as usize,
-                    MTLResourceOptions::StorageModePrivate,
-                )
-                .expect("newBufferWithLength_options returned nil (splitk scratch)");
-            if let Some(r) = residency {
-                r.insert(&buf);
-            }
-            Some(buf)
-        } else {
-            None
+        // A Private scratch buffer (the host never reads scratch back) sized to
+        // the max across bucket tapes and pinned, since dispatches bind it by
+        // baked address; `None` when no tape needs it.
+        let mut scratch = |bytes: fn(&LoweredMetalTape) -> u32, what: &str| {
+            let max = bucket_tapes.iter().map(bytes).max().unwrap_or(0);
+            (max > 0).then(|| {
+                let buf = device
+                    .newBufferWithLength_options(
+                        max as usize,
+                        MTLResourceOptions::StorageModePrivate,
+                    )
+                    .unwrap_or_else(|| panic!("newBufferWithLength_options returned nil ({what})"));
+                pin(&buf);
+                buf
+            })
         };
-
-        // Shared MoE scratch buffer for `Binding::MoeScratch`. Sized
-        // to the max per-bucket `moe_scratch_bytes` because MoE blocks
-        // within one bucket execute serially through the dispatch; cross-
-        // bucket reuse is fine because only one bucket runs per
-        // forward. Private storage — host never reads these
-        // intermediates back.
-        let max_moe_scratch_bytes: u32 = bucket_tapes
-            .iter()
-            .map(|t| t.moe_scratch_bytes)
-            .max()
-            .unwrap_or(0);
-        let moe_scratch: Option<Buffer> = if max_moe_scratch_bytes > 0 {
-            let buf = device
-                .newBufferWithLength_options(
-                    max_moe_scratch_bytes as usize,
-                    MTLResourceOptions::StorageModePrivate,
-                )
-                .expect("newBufferWithLength_options returned nil (moe scratch)");
-            if let Some(r) = residency {
-                r.insert(&buf);
-            }
-            Some(buf)
-        } else {
-            None
-        };
-
-        // Shared roped-K scratch buffer for `Binding::RopedKScratch`
-        // (spans rope-on-read, rope-once-to-scratch — NAX matrix-accel AND the
-        // simdgroup steel prefill). Sized to the max `roped_k_scratch_bytes`
-        // across buckets — one buffer suffices because the RopeOnce{Nax,Steel}
-        // command and its following attention run serially per layer through
-        // the dispatch, and the scratch is overwritten each layer (the cache, not
-        // the scratch, is the persistent artifact).
-        // Private storage — host never reads it back. Bound by dispatch-baked
-        // address, so it MUST be made resident (lazy-pager hazard).
-        let max_roped_k_scratch_bytes: u32 = bucket_tapes
-            .iter()
-            .map(|t| t.roped_k_scratch_bytes)
-            .max()
-            .unwrap_or(0);
-        let roped_k_scratch: Option<Buffer> = if max_roped_k_scratch_bytes > 0 {
-            let buf = device
-                .newBufferWithLength_options(
-                    max_roped_k_scratch_bytes as usize,
-                    MTLResourceOptions::StorageModePrivate,
-                )
-                .expect("newBufferWithLength_options returned nil (roped-K scratch)");
-            if let Some(r) = residency {
-                r.insert(&buf);
-            }
-            Some(buf)
-        } else {
-            None
-        };
-
-        // Shared hd512-unfused-attention scratch (q_head/Kdense/Vdense_T/scores/
-        // out_head packed at baked offsets). One buffer, overwritten per layer.
-        let max_attn_unfused_scratch_bytes: u32 = bucket_tapes
-            .iter()
-            .map(|t| t.attn_unfused_scratch_bytes)
-            .max()
-            .unwrap_or(0);
-        let attn_unfused_scratch: Option<Buffer> = if max_attn_unfused_scratch_bytes > 0 {
-            let buf = device
-                .newBufferWithLength_options(
-                    max_attn_unfused_scratch_bytes as usize,
-                    MTLResourceOptions::StorageModePrivate,
-                )
-                .expect("newBufferWithLength_options returned nil (attn-unfused scratch)");
-            if let Some(r) = residency {
-                r.insert(&buf);
-            }
-            Some(buf)
-        } else {
-            None
-        };
+        // SplitK: one buffer suffices because successive `affine_qmm_t_splitk`
+        // / `splitk_reduce_sum` pairs run serially inside a single encoder.
+        let splitk_scratch = scratch(|t| t.splitk_scratch_bytes, "splitk scratch");
+        // `Binding::MoeScratch`: MoE blocks within one bucket execute serially
+        // through the dispatch; cross-bucket reuse is fine because only one
+        // bucket runs per forward.
+        let moe_scratch = scratch(|t| t.moe_scratch_bytes, "moe scratch");
+        // `Binding::RopedKScratch` (spans rope-on-read, rope-once-to-scratch —
+        // NAX matrix-accel AND the simdgroup steel prefill): the
+        // RopeOnce{Nax,Steel} command and its following attention run serially
+        // per layer through the dispatch, and the scratch is overwritten each
+        // layer (the cache, not the scratch, is the persistent artifact).
+        let roped_k_scratch = scratch(|t| t.roped_k_scratch_bytes, "roped-K scratch");
+        // hd512-unfused attention (q_head/Kdense/Vdense_T/scores/out_head
+        // packed at baked offsets). One buffer, overwritten per layer.
+        let attn_unfused_scratch =
+            scratch(|t| t.attn_unfused_scratch_bytes, "attn-unfused scratch");
 
         // Runtime metadata buffers (`input_ids`, `positions`,
         // `slot_mapping`, `cu_seqlens_q`, `seq_used_k`, `block_table`)
@@ -468,7 +409,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             // Compile-time residency guard: destructure RuntimeBindings with
             // NO `..` rest so adding a new runtime buffer fails THIS build
             // until its residency is explicitly decided — either pinned here
-            // (`r.insert(field)`) or bound to `field: _` with a reason. A new
+            // (`pin(field)`) or bound to `field: _` with a reason. A new
             // dispatch-bound buffer that is silently left un-pinned reads stale
             // zero pages → token salad.
             let RuntimeBindings {
@@ -513,27 +454,27 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 // (dispatch-bound by baked gpuAddress, same lazy-pager hazard).
                 tq,
             } = runtime;
-            r.insert(input_ids);
-            r.insert(positions);
-            r.insert(cu_seqlens_q);
-            r.insert(seq_used_k);
+            pin(input_ids);
+            pin(positions);
+            pin(cu_seqlens_q);
+            pin(seq_used_k);
             // Span labels: bound by dispatch-baked address on rope-on-read
             // arches (slot 8 of the prefill attention), so pin like seq_used_k.
-            r.insert(span_ids);
+            pin(span_ids);
             // Per-KV-cache-group slot_mappings + block tables (vLLM hybrid
             // layout). One group on uniform models; full + N sliding on gemma4
             // SWA. Each is bound by dispatch-baked gpuAddress (same lazy-pager
             // hazard as the inputs), so EVERY group buffer must be pinned.
             for b in slot_mappings {
-                r.insert(b);
+                pin(b);
             }
             for b in block_tables {
-                r.insert(b);
+                pin(b);
             }
             // Spans rope-on-read per-layer flag mirrors (placeholders on
             // non-spans arches; bound by baked gpuAddress when active).
             for b in block_unrotated_flags {
-                r.insert(b);
+                pin(b);
             }
             // Gated-DeltaNet per-forward index buffers (hybrid arches:
             // Qwen3.5 / Qwen3-Next). Same contract as the inputs above —
@@ -547,8 +488,8 @@ impl<W: CanonicalParams> MetalWorker<W> {
             // answer). The factory allocates these unconditionally (a
             // 16 KiB Shared buffer even for non-hybrid arches), so the
             // insert is a harmless pin when no GDN command binds them.
-            r.insert(gdn_state_indices);
-            r.insert(gdn_is_fresh);
+            pin(gdn_state_indices);
+            pin(gdn_is_fresh);
             // Vision per-forward externs (vision towers: Qwen3.5-VL ViT).
             // Same baked-gpuAddress / lazy-pager hazard as the GDN
             // buffers above — the `vision_rope_2d` / `vision_varlen_attn`
@@ -557,42 +498,42 @@ impl<W: CanonicalParams> MetalWorker<W> {
             // zero pages (garbage rope angles / all-token-0 pixels). The
             // factory allocates 16-byte placeholders on non-vision arches,
             // so the pin is harmless when no vision command binds them.
-            r.insert(vision_rope_freqs);
-            r.insert(pixels);
-            r.insert(vision_pos_embeds);
-            r.insert(mm_embeds);
-            r.insert(mm_dst_rows);
-            r.insert(mrope_cos_sin);
-            r.insert(vision_cu_seqlens_full);
-            r.insert(vision_cu_seqlens_window);
-            r.insert(vision_window_index);
-            r.insert(vision_reverse_indices);
-            r.insert(vision_position_ids);
+            pin(vision_rope_freqs);
+            pin(pixels);
+            pin(vision_pos_embeds);
+            pin(mm_embeds);
+            pin(mm_dst_rows);
+            pin(mrope_cos_sin);
+            pin(vision_cu_seqlens_full);
+            pin(vision_cu_seqlens_window);
+            pin(vision_window_index);
+            pin(vision_reverse_indices);
+            pin(vision_position_ids);
             // TurboQuant: the packed code stores + norms + codebook are read by
             // the dequant/quantize dispatch commands via baked gpuAddress, so pin them
             // (same lazy-pager hazard). `None` on non-turboquant runs → no-op.
             if let Some(t) = tq {
                 for b in &t.packed_k {
-                    r.insert(b);
+                    pin(b);
                 }
                 for b in &t.packed_v {
-                    r.insert(b);
+                    pin(b);
                 }
                 for b in &t.norms_k {
-                    r.insert(b);
+                    pin(b);
                 }
                 for b in &t.norms_v {
-                    r.insert(b);
+                    pin(b);
                 }
-                r.insert(&t.signs);
-                r.insert(&t.boundaries);
-                r.insert(&t.centroids);
+                pin(&t.signs);
+                pin(&t.boundaries);
+                pin(&t.centroids);
                 // The fp16 scratch (table + backing data) is bound at every
                 // layer's kv_cache slot + dereffed via the table's gpuAddress.
-                r.insert(&t.scratch_k_table);
-                r.insert(&t.scratch_v_table);
-                r.insert(&t.scratch_k_data);
-                r.insert(&t.scratch_v_data);
+                pin(&t.scratch_k_table);
+                pin(&t.scratch_v_table);
+                pin(&t.scratch_k_data);
+                pin(&t.scratch_v_data);
             }
             r.commit();
         }
@@ -617,18 +558,18 @@ impl<W: CanonicalParams> MetalWorker<W> {
             // residency set so the dispatch exec dispatch sees its
             // residency entry (the dispatch never `setBuffer`s these
             // explicitly — bindings are pre-recorded in the dispatch).
-            if let (Some(r), Some(b)) = (residency, baking.moe_inline_buf.as_ref()) {
-                r.insert(b);
+            if let Some(b) = baking.moe_inline_buf.as_ref() {
+                pin(b);
             }
             bucket_bakings.push(baking);
         }
-        if let (Some(r), Some(b)) = (residency, moe_scratch.as_ref()) {
-            r.insert(b);
+        if let Some(r) = residency {
             r.commit();
         }
 
         Ok(Self {
             arena,
+            _pins: pins,
             bucket_bakings,
             splitk_scratch,
             moe_scratch,
@@ -636,6 +577,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
             attn_unfused_scratch,
             turboquant: runtime.tq.is_some(),
             tq_dequant_max_blocks: std::sync::atomic::AtomicU32::new(0),
+            unrotated_blocks: std::sync::atomic::AtomicBool::new(false),
             _marker: std::marker::PhantomData,
         })
     }
@@ -759,6 +701,15 @@ impl<W: CanonicalParams> MetalWorker<W> {
         } else {
             Vec::new()
         };
+        let facts = StepFacts {
+            num_tokens,
+            num_seqs,
+            has_spec_tokens,
+            turboquant: self.turboquant,
+            unrotated_blocks: self
+                .unrotated_blocks
+                .load(std::sync::atomic::Ordering::Relaxed),
+        };
         for step in mtl4_steps {
             enc.setComputePipelineState(&step.pipeline);
             for ((((table, (tg, tpt)), need_barrier), scaling), gate) in step
@@ -790,17 +741,10 @@ impl<W: CanonicalParams> MetalWorker<W> {
                         need_barrier = false;
                     }
                 }
-                if !gate_matches(
-                    *gate,
-                    num_tokens,
-                    num_seqs,
-                    has_spec_tokens,
-                    self.turboquant,
-                ) {
-                    // Skipped: the lm_head slice's gather/qmv/scatter
-                    // (gated single-seq) doesn't fire for batched
-                    // batches; the M=bucket_m fallback (gated
-                    // multi-seq) doesn't fire for single-seq prefill.
+                if !gate_matches(*gate, facts) {
+                    // Skipped: e.g. the lm_head slice's gather/qmv/scatter
+                    // (`OnlyIfNoSpec`) on a spec-decode verify step, or
+                    // its M=bucket_m fallback (`OnlyIfSpec`) on any other.
                     // Either way the timestamp slot, barrier, and
                     // dispatch are skipped together so the kernel
                     // doesn't run with stale per-dispatch state.
@@ -834,42 +778,39 @@ impl<W: CanonicalParams> MetalWorker<W> {
                     super::ids::NumTokens(num_tokens),
                     num_seqs,
                 );
-                // TurboQuant full-context dequant: the baked grid is a
+                // TurboQuant full-context staging: the baked grid is a
                 // placeholder; the kernel needs (max_blocks, num_kv_heads,
                 // num_seqs) — block-table-driven, with early-exit past
-                // seqused_k. max_blocks (grid.x) is read by the kernel from
-                // threadgroups_per_grid.x; grid.z = the live batch's num_seqs.
-                let tg_scaled =
-                    if matches!(step.kernel, super::lowered::KernelId::TqDequantToScratch) {
-                        // grid.x MUST equal the host block-table ROW STRIDE
-                        // (`max_blocks_eff`), which the kernel uses BOTH as the
-                        // block loop bound AND the `block_table[seq*stride + b]`
-                        // stride. The static `W::MAX_BLOCKS_PER_SEQ` (128 for
-                        // uniform arches like Llama) truncated the dequant at 128
-                        // blocks / 2048 tokens, so the reused fp16 scratch's tail
-                        // kept the PREVIOUS layer's KV → attention collapse to
-                        // `!!!!` past 2048 tokens. The per-forward runtime width is
-                        // stashed from `inputs.block_tables` (== the stride the host
-                        // padded the block_table to); fall back to the baked const
-                        // when unset (0). Floor at the const so we never shrink
-                        // below the host stride for short contexts.
-                        let runtime_mb = self
-                            .tq_dequant_max_blocks
-                            .load(std::sync::atomic::Ordering::Relaxed);
-                        let baked =
-                            <W as ::scratchy_forward_compiler::CanonicalParams>::MAX_BLOCKS_PER_SEQ;
-                        // Cover the whole active context: the runtime block-table
-                        // width (== the host's padded stride), floored at the baked
-                        // const so short contexts never shrink below it.
-                        let cover = runtime_mb.max(baked) as usize;
-                        MTLSize {
-                            width: cover,
-                            height: tg_scaled.height,
-                            depth: (num_seqs as usize).max(1),
-                        }
-                    } else {
-                        tg_scaled
-                    };
+                // seqused_k; grid.z = the live batch's num_seqs.
+                let tg_scaled = if matches!(step.kernel, super::lowered::KernelId::TqStageRotated) {
+                    // grid.x must cover the host block-table ROW WIDTH
+                    // (`max_blocks_eff`) — every block of the longest
+                    // sequence. The static `W::MAX_BLOCKS_PER_SEQ` (128 for
+                    // uniform arches like Llama) truncated the pass at 128
+                    // blocks / 2048 tokens, so the reused fp16 scratch's tail
+                    // kept the PREVIOUS layer's KV → attention collapse to
+                    // `!!!!` past 2048 tokens. The per-forward runtime width is
+                    // stashed from `inputs.block_tables` (== the stride the host
+                    // padded the block_table to); fall back to the baked const
+                    // when unset (0). Floor at the const so we never shrink
+                    // below the host stride for short contexts.
+                    let runtime_mb = self
+                        .tq_dequant_max_blocks
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let baked =
+                        <W as ::scratchy_forward_compiler::CanonicalParams>::MAX_BLOCKS_PER_SEQ;
+                    // Cover the whole active context: the runtime block-table
+                    // width (== the host's padded stride), floored at the baked
+                    // const so short contexts never shrink below it.
+                    let cover = runtime_mb.max(baked) as usize;
+                    MTLSize {
+                        width: cover,
+                        height: tg_scaled.height,
+                        depth: (num_seqs as usize).max(1),
+                    }
+                } else {
+                    tg_scaled
+                };
                 // RopeOnce{Steel,Nax,GqaShared}: the pre-roped-K scratch is sized to
                 // MAX_BLOCKS_PER_SEQ logical blocks (lowering), and the steel/gqa
                 // attention reads the WHOLE sequence's roped K (computed prefix +
@@ -879,7 +820,7 @@ impl<W: CanonicalParams> MetalWorker<W> {
                 // tokens. Override grid.y to the live block-table width
                 // (`tq_dequant_max_blocks`, == kv_len/block_size), capped at the
                 // baked num_pages (the scratch's block capacity). Mirrors the
-                // TqDequantToScratch grid override above.
+                // TqStageRotated grid override above.
                 let tg_scaled = if matches!(
                     step.kernel,
                     super::lowered::KernelId::RopeOnceSteel
@@ -942,6 +883,7 @@ fn is_fused(id: KernelId) -> bool {
             | K::RopeAppendNormed
             | K::NormAddScalarMul
             | K::SynthGateUpSiluMul
+            | K::AttentionViaCacheTq
     )
 }
 
@@ -962,6 +904,7 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::RopeOnceSteel
         | K::RopeOnceGqaShared => KernelKind::Rope,
         K::AttentionViaCache
+        | K::AttentionViaCacheTq
         | K::AttentionPrefillSdpaPaged
         | K::AttnGatherKRope
         | K::AttnGatherVCopyT
@@ -981,6 +924,7 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::AffineGatherQmmTNax
         | K::AffineQmmTSplitK
         | K::AffineQmmTNax
+        | K::AffineQmmSmallM
         | K::Nvfp4Qmv
         | K::Nvfp4QmmT
         | K::Nvfp4QmmTNax
@@ -1018,7 +962,8 @@ fn kernel_kind(id: KernelId) -> KernelKind {
         | K::Add
         | K::BiasAdd
         | K::Reshape
-        | K::TqDequantToScratch
+        | K::TqStageRotated
+        | K::TqRotateRows
         | K::TqQuantizeToPacked => KernelKind::Elementwise,
     }
 }
@@ -1937,13 +1882,14 @@ fn resolve_bindings<W: CanonicalParams>(
 /// full-`M=bucket_m` lm_head fallback is gated this way so the
 /// slice's per-seq-incorrect logits get overwritten with a
 /// correct multi-row GEMM result.
-pub(super) fn gate_matches(
-    gate: Option<super::lowered::RuntimeGate>,
-    num_tokens: u32,
-    num_seqs: u32,
-    has_spec_tokens: bool,
-    turboquant: bool,
-) -> bool {
+pub(super) fn gate_matches(gate: Option<super::lowered::RuntimeGate>, step: StepFacts) -> bool {
+    let StepFacts {
+        num_tokens,
+        num_seqs,
+        has_spec_tokens,
+        turboquant,
+        unrotated_blocks,
+    } = step;
     // lm_head slice (`OnlyIfNoSpec`) fires only when there are EXTRA
     // tokens to drop (prefill / chunked-prefill / mixed batches);
     // steady-state decode has `num_tokens == num_seqs` and slicing
@@ -1952,6 +1898,7 @@ pub(super) fn gate_matches(
     // unconditionally on multi-seq regressed c=4 TPOT by +5% on
     // Llama-1B; gating on `num_tokens > num_seqs` keeps the prefill
     // win without hurting decode.
+    let turboquant_decode = turboquant && num_tokens == num_seqs;
     match gate {
         None => true,
         Some(super::lowered::RuntimeGate::OnlyIfNoSpec) => {
@@ -1959,7 +1906,36 @@ pub(super) fn gate_matches(
         }
         Some(super::lowered::RuntimeGate::OnlyIfSpec) => has_spec_tokens,
         Some(super::lowered::RuntimeGate::OnlyIfTurboquant) => turboquant,
+        Some(super::lowered::RuntimeGate::OnlyIfTurboquantDecode) => turboquant_decode,
+        Some(super::lowered::RuntimeGate::OnlyIfTurboquantNotDecode) => {
+            turboquant && !turboquant_decode
+        }
+        Some(super::lowered::RuntimeGate::UnlessTurboquantDecode) => !turboquant_decode,
+        Some(super::lowered::RuntimeGate::OnlyIfSmallMTokens) => {
+            crate::quantized::SMALL_M_TOKENS.contains(&num_tokens)
+        }
+        Some(super::lowered::RuntimeGate::UnlessSmallMTokens) => {
+            !crate::quantized::SMALL_M_TOKENS.contains(&num_tokens)
+        }
+        Some(super::lowered::RuntimeGate::OnlyIfOneSequence) => num_seqs == 1,
+        Some(super::lowered::RuntimeGate::UnlessOneSequence) => num_seqs > 1,
+        Some(super::lowered::RuntimeGate::OnlyIfUnrotatedBlocks) => unrotated_blocks,
+        Some(super::lowered::RuntimeGate::UnlessUnrotatedBlocks) => !unrotated_blocks,
+        Some(super::lowered::RuntimeGate::All(gates)) => {
+            gates.iter().all(|g| gate_matches(Some(*g), step))
+        }
     }
+}
+
+/// What a runtime gate can ask about the step being encoded.
+#[derive(Clone, Copy)]
+pub(super) struct StepFacts {
+    pub num_tokens: u32,
+    pub num_seqs: u32,
+    pub has_spec_tokens: bool,
+    pub turboquant: bool,
+    /// Some sequence's block table has an unrotated (bit-31, span) block.
+    pub unrotated_blocks: bool,
 }
 
 fn scale_tg_for_num_tokens(
@@ -2036,6 +2012,132 @@ mod tests {
     use scratchy_layers::{Linear, LinearLayer, RmsNorm};
     use scratchy_tensors::{DType, DeviceAllocator, GpuTensor};
     use std::sync::Arc;
+
+    /// The sequence gates follow the step's sequence count, not its token
+    /// count; the span-block gates follow the step's block tables; and `All`
+    /// needs every gate: under TurboQuant a decode step runs none of the
+    /// prefill attention's variants.
+    #[test]
+    fn sequence_and_span_block_gates_follow_the_step() {
+        use super::super::lowered::RuntimeGate::{
+            All, OnlyIfOneSequence, OnlyIfUnrotatedBlocks, UnlessOneSequence,
+            UnlessTurboquantDecode, UnlessUnrotatedBlocks,
+        };
+        let step = |num_tokens, num_seqs, turboquant, unrotated_blocks| StepFacts {
+            num_tokens,
+            num_seqs,
+            has_spec_tokens: false,
+            turboquant,
+            unrotated_blocks,
+        };
+        for (tokens, seqs, one) in [(512, 1, true), (512, 2, false), (16, 16, false)] {
+            let s = step(tokens, seqs, false, false);
+            assert_eq!(gate_matches(Some(OnlyIfOneSequence), s), one);
+            assert_eq!(gate_matches(Some(UnlessOneSequence), s), !one);
+        }
+        for unrotated in [false, true] {
+            let s = step(512, 2, false, unrotated);
+            assert_eq!(gate_matches(Some(OnlyIfUnrotatedBlocks), s), unrotated);
+            assert_eq!(gate_matches(Some(UnlessUnrotatedBlocks), s), !unrotated);
+        }
+        let plain = All(&[
+            UnlessTurboquantDecode,
+            UnlessOneSequence,
+            UnlessUnrotatedBlocks,
+        ]);
+        assert!(gate_matches(Some(plain), step(512, 2, true, false)));
+        assert!(!gate_matches(Some(plain), step(512, 2, true, true)));
+        assert!(!gate_matches(Some(plain), step(512, 1, true, false)));
+        assert!(
+            !gate_matches(Some(plain), step(2, 2, true, false)),
+            "a TurboQuant decode step"
+        );
+    }
+
+    /// The lm_head sample slice, as the tape builds and dispatches it: the
+    /// gather moves each sequence's last row to row `i`, the scatter moves
+    /// row `i` back, both in place. In a mixed step, decodes and short chunks
+    /// put some sequences' last rows inside `0..num_seqs`, the rows the
+    /// others are moved to; every sequence must still get its own row.
+    #[test]
+    fn sample_slice_moves_each_sequences_own_row() {
+        let Some(device) = crate::detect_device().filter(|_| crate::metal4_available()) else {
+            eprintln!("skipping: no Metal device");
+            return;
+        };
+        let device = device.device.clone();
+        let cache = SpecializedPipelineCache::with_standard_shaders(device.clone())
+            .expect("compile standard shaders");
+        let p = crate::tape::model_consts::MetalModelConsts {
+            metal_dtype: MetalDtype::F16,
+            ..crate::tape::model_consts::MetalModelConsts::from_canonical::<TestWeights>()
+        };
+        // Decodes, then short prefix-hit chunks, then long chunks.
+        let q_lens: Vec<u32> = [vec![1; 24], vec![2; 16], vec![3; 8], vec![40; 4]].concat();
+        let cu: Vec<u32> = std::iter::once(0)
+            .chain(q_lens.iter().scan(0, |end, n| {
+                *end += n;
+                Some(*end)
+            }))
+            .collect();
+        let (num_seqs, num_tokens) = (q_lens.len(), *cu.last().unwrap() as usize);
+        let last = |i: usize| cu[i + 1] as usize - 1;
+        let width = 1024u32;
+        let bucket_m = 512;
+        for gather in [true, false] {
+            let cmd = if gather {
+                crate::tape::lowering::gather_last_token_command(&p, 0, width)
+            } else {
+                crate::tape::lowering::scatter_first_to_last_row_command(&p, 0, width)
+            };
+            let pso = cache
+                .get_or_build(&crate::specialized_pipeline_cache::PipelineKey::new(
+                    cmd.library,
+                    cmd.function,
+                    cmd.constants.to_vec(),
+                ))
+                .expect("pipeline");
+            let (grid, threads) = mtl_size_pair(&cmd);
+            let grid = scale_tg_for_num_tokens(
+                grid,
+                cmd.dispatch.m_scaling,
+                super::super::ids::NumTokens(num_tokens as u32),
+                num_seqs as u32,
+            );
+            // Every element of row `r` holds `r`.
+            let rows: Vec<u16> = (0..bucket_m as usize)
+                .flat_map(|r| {
+                    std::iter::repeat_n(half::f16::from_f32(r as f32).to_bits(), width as usize)
+                })
+                .collect();
+            let buf = crate::mtl4_dispatch::shared_slice(&device, &rows);
+            let cu_buf = crate::mtl4_dispatch::shared_slice(&device, &cu);
+            let n_buf = crate::mtl4_dispatch::shared_u32(&device, num_seqs as u32);
+            assert!(crate::mtl4_dispatch::dispatch_threadgroups(
+                &device,
+                &pso,
+                &[&buf, &cu_buf, &n_buf],
+                grid,
+                threads,
+            ));
+            let got: Vec<u16> = crate::mtl4_dispatch::read_slice(&buf, rows.len());
+            let row = |r: usize| &got[r * width as usize..][..width as usize];
+            for (i, q_len) in q_lens.iter().enumerate() {
+                // Gather: row i holds sequence i's last row. Scatter: that
+                // last row holds row i, sequence i's logits.
+                let (at, want) = if gather { (i, last(i)) } else { (last(i), i) };
+                let want = half::f16::from_f32(want as f32).to_bits();
+                let wrong = row(at).iter().filter(|&&x| x != want).count();
+                assert_eq!(
+                    wrong,
+                    0,
+                    "{}: sequence {i} ({} tokens): {wrong} of {width} elements of row {at} are another row's",
+                    if gather { "gather" } else { "scatter" },
+                    q_len
+                );
+            }
+        }
+    }
 
     /// Test fixture: holds `CanonicalParams` constants AND the layer
     /// instances the `WeightAccessors` impl below returns. Plays the
@@ -2664,7 +2766,7 @@ mod tests {
             kernel: KernelId::RmsNorm,
             library: rmsnorm_pre.library,
             function: rmsnorm_pre.function,
-            constants: rmsnorm_pre.constants.clone(),
+            constants: rmsnorm_pre.constants,
             dispatch: rmsnorm_pre.dispatch,
             bindings: rmsnorm_pre
                 .bindings

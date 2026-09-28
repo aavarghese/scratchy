@@ -71,8 +71,8 @@ use scratchy_target_metal::OwnedTensor;
 // `GpuDevice` resolves to the Apple-silicon arm carrying `device + queue +
 // allocator`; `OwnedTensor` / `TensorView` / `GpuTensor` / `GpuWeights` are
 // the ones lifted to `cfg(any(cuda, metal))` in Step 1; `MetalAllocator`
-// is the metal-side `BackendAllocator`; `MetalMem::from_buffer` wraps
-// `metal::Buffer` for the metal arm of the KV/GDN pools.
+// is the metal-side `BackendAllocator`; `MetalMem` wraps `metal::Buffer`
+// for the metal arm of the KV/GDN pools.
 #[cfg(feature = "metal")]
 use ::objc2_metal::{MTLBuffer as _, MTLDevice as _};
 #[cfg(feature = "metal")]
@@ -157,18 +157,6 @@ pub struct MetalWorker {
     // ---------------------------------------------------------------
     config: WorkerCreateConfig,
     kv_cache: Option<KvCachePool>,
-    /// TurboQuant KV compression runtime — `Some` only when
-    /// `kv_cache_dtype == "turboquant"`. After each forward writes KV, the
-    /// worker calls `compress_layer` per layer over the new slots: quantizes
-    /// them into the per-layer packed store (~4.6x) and writes the dequant back
-    /// into the fp16 pool, so attention reads TurboQuant'd KV. OFF by default.
-    turboquant: Option<scratchy_target_metal::turboquant::TurboQuantRuntime>,
-    /// TurboQuant eviction-layer window map: logical KV block -> bounded fp16
-    /// window slot. `Some` alongside `turboquant`. Opt-in via SCRATCHY_TQ_WINDOW
-    /// — when set, the forward remaps block_table/slot_mapping logical->window,
-    /// dequant-fills evicted misses from the packed store, and the packed store
-    /// is the canonical full-capacity cache (the 4.6x). Off => the in-place path.
-    tq_window: Option<scratchy_target_metal::turboquant_window::WindowMap>,
     /// Gated-DeltaNet recurrent-state pool for hybrid arches (Qwen3.5 /
     /// Qwen3-Next). `Some(_)` only when the loaded model's
     /// `gdn_runtime_config()` is `Some` (built in `initialize_cache`).
@@ -297,6 +285,11 @@ pub struct MetalWorker {
     /// order `execute_model` built. Written by `forward_argmax_blocking` after
     /// the (single) host wait, read + cleared by `execute_model`.
     fused_sampled: Option<Vec<u32>>,
+    /// The greedy argmax's output (one u32 per row) and its `[batch, vocab]`
+    /// constants, reused across forwards and grown only when a forward has
+    /// more rows.
+    argmax_out: Option<scratchy_target_metal::residency::Pinned>,
+    argmax_consts: Option<scratchy_target_metal::residency::Pinned>,
     /// Per-request grammar FSM state for constrained / guided decoding
     /// (`guided_grammar` / `response_format`). Keyed by req_id; created
     /// the first time a request with a grammar is scheduled and dropped
@@ -316,24 +309,14 @@ pub struct MetalWorker {
     /// `forward_argmax_blocking` to dispatch the mask before argmax.
     #[cfg(feature = "guided-decoding")]
     grammar_pending: Option<GrammarMaskHost>,
-    /// Persistent residency-pinned GPU buffers for the grammar mask, reused
-    /// across decode steps (memcpy per step). They MUST be pinned in the
-    /// residency set: a freshly-allocated, gpuAddress-bound bitset is evicted
-    /// under KV memory pressure (large-vocab models like Qwen at long context),
-    /// so the kernel would read garbage and the mask would silently fail. Grown
-    /// (realloc + re-pin + commit) only when a batch's bitset/row count exceeds
-    /// the current capacity; steady-state steps just memcpy into them.
+    /// The grammar mask's allow-bitsets, row map and constants, reused across
+    /// decode steps (memcpy per step) and grown only when a batch needs more.
     #[cfg(feature = "guided-decoding")]
-    grammar_buf_allow: Option<scratchy_target_metal::grammar_mask::Buffer>,
+    grammar_buf_allow: Option<scratchy_target_metal::residency::Pinned>,
     #[cfg(feature = "guided-decoding")]
-    grammar_buf_rows: Option<scratchy_target_metal::grammar_mask::Buffer>,
+    grammar_buf_rows: Option<scratchy_target_metal::residency::Pinned>,
     #[cfg(feature = "guided-decoding")]
-    grammar_buf_gconsts: Option<scratchy_target_metal::grammar_mask::Buffer>,
-    /// Capacities (in u32 words) of `grammar_buf_allow` / `grammar_buf_rows`.
-    #[cfg(feature = "guided-decoding")]
-    grammar_cap_allow: usize,
-    #[cfg(feature = "guided-decoding")]
-    grammar_cap_rows: usize,
+    grammar_buf_gconsts: Option<scratchy_target_metal::residency::Pinned>,
     /// Phase 6 chain-advance kernel. One small kernel that bumps
     /// per-req `runtime.positions` / `slot_mapping` / `seqused_k` in
     /// place between K-step chain iters. Cached at load_model so the
@@ -543,6 +526,56 @@ impl MetalWorker {
     }
 }
 
+/// One step's per-token KV write targets, in the kernels' `slot_mapping`
+/// encoding: the slot, with [`UNROTATED_BLOCK_BIT`] for a span block, or
+/// `u32::MAX` to write nothing. A slot has at most one writer per step. Two
+/// sequences can be handed the same block for tokens they both compute (a full
+/// prefix-cache hit backs off one block but keeps the hit block), and a second
+/// write races with the first (TurboQuant's prefill staging re-rotates the row
+/// in place), so a later writer skips and reads the first writer's keys like
+/// any cached row.
+///
+/// [`UNROTATED_BLOCK_BIT`]: scratchy_target_metal::UNROTATED_BLOCK_BIT
+#[cfg(feature = "metal")]
+struct StepSlotMapping {
+    slots: Vec<u32>,
+    written: std::collections::HashSet<u32>,
+}
+
+#[cfg(feature = "metal")]
+impl StepSlotMapping {
+    const SKIP: u32 = u32::MAX;
+
+    fn with_capacity(tokens: usize) -> Self {
+        Self {
+            slots: Vec::with_capacity(tokens),
+            written: std::collections::HashSet::with_capacity(tokens),
+        }
+    }
+
+    /// The next token writes its K/V to `slot`, K unrotated if `unrotated`.
+    fn write(&mut self, slot: usize, unrotated: bool) {
+        let bit = scratchy_target_metal::UNROTATED_BLOCK_BIT;
+        let slot = u32::try_from(slot)
+            .ok()
+            .filter(|s| s & bit == 0)
+            .expect("KV slot below the unrotated-block bit");
+        if !self.written.insert(slot) {
+            return self.skip();
+        }
+        self.slots.push(if unrotated { slot | bit } else { slot });
+    }
+
+    /// The next token writes no K/V.
+    fn skip(&mut self) {
+        self.slots.push(Self::SKIP);
+    }
+
+    fn into_slots(self) -> Vec<u32> {
+        self.slots
+    }
+}
+
 /// Per-block KV bytes for one model: layers × 2 (K+V) × heads × head_dim × block_size × 2 bytes.
 /// bf16 and f16 are both 2 bytes/elt under metal; int4 KV is unsupported.
 #[cfg(feature = "metal")]
@@ -611,8 +644,6 @@ impl MetalWorker {
         Self {
             config,
             kv_cache: None,
-            turboquant: None,
-            tq_window: None,
             gdn_state: None,
             gdn_slot_allocator: None,
             gdn_pending: None,
@@ -653,6 +684,8 @@ impl MetalWorker {
             sampler_logits: None,
             pending_sampler: None,
             fused_sampled: None,
+            argmax_out: None,
+            argmax_consts: None,
             #[cfg(feature = "guided-decoding")]
             grammar_states: HashMap::new(),
             #[cfg(feature = "guided-decoding")]
@@ -667,10 +700,6 @@ impl MetalWorker {
             grammar_buf_rows: None,
             #[cfg(feature = "guided-decoding")]
             grammar_buf_gconsts: None,
-            #[cfg(feature = "guided-decoding")]
-            grammar_cap_allow: 0,
-            #[cfg(feature = "guided-decoding")]
-            grammar_cap_rows: 0,
             chain_advance_kernel: None,
             draft_queue: None,
             target_kv_single_buffers: Vec::new(),
@@ -1152,11 +1181,11 @@ impl MetalWorker {
         for _ in 0..(num_layers_draft * 2) {
             let layer = scratchy_target_metal::single_buffer_kv::SingleBufferKvLayer::new(
                 &mtl_device,
+                &residency,
                 chunk_bytes_logical_draft,
                 num_chunks_total_draft,
             )
             .map_err(|e| ExecutorError::WorkerInit(format!("draft SingleBufferKvLayer: {e}")))?;
-            residency.insert(layer.buffer());
             draft_single_buf_layers.push(layer);
         }
         info!(
@@ -1206,16 +1235,7 @@ impl MetalWorker {
                         bytes,
                     ))
                 },
-                |bytes| {
-                    let buffer = mtl_device
-                        .newBufferWithLength_options(
-                            bytes,
-                            ::objc2_metal::MTLResourceOptions::StorageModeShared,
-                        )
-                        .expect("newBufferWithLength_options returned nil");
-                    residency.insert(&buffer);
-                    Ok(MetalMem::from_buffer(buffer))
-                },
+                |bytes| Ok(MetalMem::new_pinned(&mtl_device, &residency, bytes)),
             )
         }
         .map_err(|e| ExecutorError::WorkerInit(format!("draft KvCachePool: {e}")))?;
@@ -1299,20 +1319,12 @@ impl MetalWorker {
             };
             (is_bf16, model.vocab_size() as u32)
         };
-        let device = self
+        let gpu_device = self
             .gpu_device
             .as_ref()
-            .ok_or_else(|| ExecutorError::WorkerExecution("gpu sampler: no gpu_device".into()))?
-            .device
-            .clone();
-
-        let residency = self
-            .gpu_device
-            .as_ref()
-            .ok_or_else(|| ExecutorError::WorkerExecution("gpu sampler: no gpu_device".into()))?
-            .allocator
-            .residency()
-            .clone();
+            .ok_or_else(|| ExecutorError::WorkerExecution("gpu sampler: no gpu_device".into()))?;
+        let device = gpu_device.device.clone();
+        let residency = gpu_device.allocator.residency().clone();
 
         // Assemble this step's sampler inputs (metal's `GpuSampleParams` layout)
         // and hand them to the metal sampler. The per-request seed inside comes
@@ -1431,24 +1443,23 @@ fn metal_chain_dispatch(
     };
 
     // ── 2. Allocate K argmax output buffers (host-visible) ──────
+    // Pinned for the duration of this call, like the constants below.
+    let residency = device_mut.allocator.residency().clone();
+    let pin_zeroed = |bytes| {
+        residency.pin(scratchy_target_metal::mtl4_dispatch::shared_zeroed(
+            &mtl_device,
+            bytes,
+        ))
+    };
     let argmax_bytes = (req.num_tokens.max(1)) * 4;
-    let argmax_bufs: Vec<
-        ::objc2::rc::Retained<::objc2::runtime::ProtocolObject<dyn ::objc2_metal::MTLBuffer>>,
-    > = (0..k)
-        .map(|_| {
-            mtl_device
-                .newBufferWithLength_options(
-                    argmax_bytes,
-                    ::objc2_metal::MTLResourceOptions::StorageModeShared,
-                )
-                .expect("argmax_buf alloc returned nil")
-        })
-        .collect();
+    let pinned_argmax: Vec<_> = (0..k).map(|_| pin_zeroed(argmax_bytes)).collect();
+    let argmax_bufs: Vec<scratchy_target_metal::mtl4_dispatch::Buffer> =
+        pinned_argmax.iter().map(|b| (**b).clone()).collect();
 
     // ── 3. Pack constants ───────────────────────────────────────
-    let consts_buf = mtl_device
-        .newBufferWithLength_options(16, ::objc2_metal::MTLResourceOptions::StorageModeShared)
-        .expect("consts_buf alloc returned nil");
+    let pinned_consts = pin_zeroed(16);
+    residency.commit();
+    let consts_buf = (*pinned_consts).clone();
     let vocab_u32 = model_ref.vocab_size() as u32;
     unsafe {
         let p = consts_buf.contents().as_ptr() as *mut u32;
@@ -1719,114 +1730,9 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
             .ok_or_else(|| BackendError::Backend("gpu_device not initialized".into()))?;
         let mtl_device = device_buf.device.clone();
         // Owned handle to the shared residency set, cloned early (before the
-        // later `self.gpu_device.as_mut()` borrow) so the grammar-mask buffers
-        // can be pinned without extending `device_buf`'s borrow.
-        #[cfg(feature = "guided-decoding")]
-        let grammar_residency = device_buf.allocator.residency().clone();
-
-        // ── TurboQuant eviction-layer remap (opt-in: SCRATCHY_TQ_WINDOW) ──────
-        // The packed store is the canonical full-capacity cache; attention reads
-        // a BOUNDED fp16 window. Remap the logical block_table/slot_mapping to
-        // window slots, and dequant-fill evicted misses from packed before
-        // attention. A logical block written at offset 0 this forward is "fresh"
-        // (reuse-safe: a reallocated logical block is always written from 0), so
-        // it's assigned a window slot with NO dequant. Off => the in-place path
-        // below is byte-identical. Uniform geometry (gemma4 hybrid deferred).
-        let window_on = matches!(kv_pool, KvPoolHandle::TARGET)
-            && self.turboquant.is_some()
-            && self.tq_window.is_some()
-            && std::env::var_os("SCRATCHY_TQ_WINDOW").is_some();
-        let bs = self.config.block_size.max(1);
-        let num_reqs_rm = req.cu_seqlens_q.len().saturating_sub(1);
-        let (eff_block_table, eff_slot_mapping, window_misses): (
-            Vec<u32>,
-            Vec<u32>,
-            Vec<(u32, u32)>,
-        ) = if window_on {
-            let max_blocks = req
-                .block_table
-                .len()
-                .checked_div(num_reqs_rm)
-                .unwrap_or(req.block_table.len());
-            let bs32 = bs as u32;
-            let wm = self.tq_window.as_mut().unwrap();
-            let mut fresh = std::collections::HashSet::new();
-            for &s in req.slot_mapping {
-                if s % bs32 == 0 {
-                    fresh.insert(s / bs32);
-                }
-            }
-            let mut rbt = req.block_table.to_vec();
-            let mut misses: Vec<(u32, u32)> = Vec::new();
-            for sq in 0..num_reqs_rm {
-                let used = req.seqused_k.get(sq).copied().unwrap_or(0) as usize;
-                let valid = used.div_ceil(bs).min(max_blocks);
-                for i in 0..valid {
-                    let logical = req.block_table[sq * max_blocks + i];
-                    let wslot = if fresh.contains(&logical) {
-                        wm.assign_fresh(logical) as u32
-                    } else {
-                        let r = wm.resolve(logical);
-                        if r.miss {
-                            misses.push((logical, r.slot as u32));
-                        }
-                        r.slot as u32
-                    };
-                    rbt[sq * max_blocks + i] = wslot;
-                }
-            }
-            let mut rsm = req.slot_mapping.to_vec();
-            for (t, &ls) in req.slot_mapping.iter().enumerate() {
-                let lb = ls / bs32;
-                let off = ls % bs32;
-                let wb = wm.slot_of(lb).map(|x| x as u32).unwrap_or(lb);
-                rsm[t] = wb * bs32 + off;
-            }
-            (rbt, rsm, misses)
-        } else {
-            (Vec::new(), Vec::new(), Vec::new())
-        };
-        if window_on
-            && !window_misses.is_empty()
-            && let Some(tq) = self.turboquant.as_ref()
-        {
-            let bs32 = bs as u32;
-            let mut src = Vec::with_capacity(window_misses.len() * bs);
-            let mut dst = Vec::with_capacity(window_misses.len() * bs);
-            for &(lblock, wblock) in &window_misses {
-                for tok in 0..bs32 {
-                    src.push(lblock * bs32 + tok);
-                    dst.push(wblock * bs32 + tok);
-                }
-            }
-            let src_buf = Self::alloc_shared_u32_buf(&mtl_device, &src);
-            let dst_buf = Self::alloc_shared_u32_buf(&mtl_device, &dst);
-            let n = src.len() as u32;
-            for layer in 0..tq.num_layers() {
-                let kb: Vec<&_> = kv_cache_ref
-                    .k_chunk_bufs(layer)
-                    .iter()
-                    .map(|m| m.buffer())
-                    .collect();
-                let vb: Vec<&_> = kv_cache_ref
-                    .v_chunk_bufs(layer)
-                    .iter()
-                    .map(|m| m.buffer())
-                    .collect();
-                tq.dequant_into_window(
-                    &mtl_device,
-                    layer,
-                    kv_cache_ref.k_chunk_table_mem(layer).buffer(),
-                    &kb,
-                    kv_cache_ref.v_chunk_table_mem(layer).buffer(),
-                    &vb,
-                    &src_buf,
-                    &dst_buf,
-                    n,
-                )
-                .map_err(|e| BackendError::Backend(format!("tq dequant_into_window: {e:?}")))?;
-            }
-        }
+        // later `self.gpu_device.as_mut()` borrow) so the argmax and grammar-mask
+        // buffers can be pinned without extending `device_buf`'s borrow.
+        let residency = device_buf.allocator.residency().clone();
 
         let argmax_kernels = self
             .argmax_kernels
@@ -1836,28 +1742,10 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
         // ── 1. Upload host slices to fresh shared-storage MTLBuffers ─────
         let buf_input_ids = Self::alloc_shared_u32_buf(&mtl_device, req.input_ids);
         let buf_positions = Self::alloc_shared_u32_buf(&mtl_device, req.positions);
-        // window path binds the REMAPPED (window) slot_mapping/block_table for
-        // the forward; the logical slot_mapping is kept for the packed-store
-        // index in the post-forward compress.
-        let buf_slot_mapping = Self::alloc_shared_u32_buf(
-            &mtl_device,
-            if window_on {
-                &eff_slot_mapping
-            } else {
-                req.slot_mapping
-            },
-        );
-        let buf_logical_slot_mapping = Self::alloc_shared_u32_buf(&mtl_device, req.slot_mapping);
+        let buf_slot_mapping = Self::alloc_shared_u32_buf(&mtl_device, req.slot_mapping);
         let buf_cu_seqlens = Self::alloc_shared_u32_buf(&mtl_device, req.cu_seqlens_q);
         let buf_seqused_k = Self::alloc_shared_u32_buf(&mtl_device, req.seqused_k);
-        let buf_block_table = Self::alloc_shared_u32_buf(
-            &mtl_device,
-            if window_on {
-                &eff_block_table
-            } else {
-                req.block_table
-            },
-        );
+        let buf_block_table = Self::alloc_shared_u32_buf(&mtl_device, req.block_table);
         // Stage the sample-row indices for the lm_head slice. The
         // closure inside macro-generated `forward` reads these via
         // `ctx.last_token_indices.as_raw()` and converts to a `&[u32]`
@@ -2087,16 +1975,17 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
         // one host wait. Pre-6a took the unfused path (separate dispatch
         // + commit + wait + readback) for 5.2a simplicity; this re-folds
         // it. Per call: 2 commit+waits → 1.
-        let argmax_bytes = (req.num_tokens.max(1)) * 4;
-        let argmax_out = mtl_device
-            .newBufferWithLength_options(
-                argmax_bytes,
-                ::objc2_metal::MTLResourceOptions::StorageModeShared,
-            )
-            .expect("argmax_out alloc returned nil");
-        let consts_buf = mtl_device
-            .newBufferWithLength_options(8, ::objc2_metal::MTLResourceOptions::StorageModeShared)
-            .expect("argmax consts alloc returned nil");
+        let grew = reserve_pinned(
+            &mut self.argmax_out,
+            &mtl_device,
+            &residency,
+            req.num_tokens.max(1) * 4,
+        ) | reserve_pinned(&mut self.argmax_consts, &mtl_device, &residency, 8);
+        if grew {
+            residency.commit();
+        }
+        let argmax_out = (**self.argmax_out.as_ref().expect("reserved above")).clone();
+        let consts_buf = (**self.argmax_consts.as_ref().expect("reserved above")).clone();
         let arg_table = {
             use ::objc2_metal::MTL4ArgumentTableDescriptor;
             let desc = MTL4ArgumentTableDescriptor::new();
@@ -2117,11 +2006,8 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
             argmax_kernels;
         let argmax_kernels_addr = argmax_kernels_ptr as usize;
         // Stage this step's grammar mask (constrained / guided decoding) into
-        // the PERSISTENT residency-pinned buffers (grown + re-pinned only when a
-        // batch exceeds capacity). Pinning is mandatory: a per-step freshly
-        // allocated bitset gets evicted under KV pressure and the kernel reads
-        // garbage (see the `grammar_buf_*` field docs). The closure binds these
-        // by gpuAddress and runs the mask on the forward encoder before argmax.
+        // its pinned buffers. The closure binds these by gpuAddress and runs
+        // the mask on the forward encoder before argmax.
         #[cfg(feature = "guided-decoding")]
         let grammar_pending = self.grammar_pending.take();
         #[cfg(feature = "guided-decoding")]
@@ -2131,40 +2017,20 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
             use ::objc2_metal::{MTLBuffer, MTLDevice};
             let kernels_addr =
                 kernels as *const scratchy_target_metal::grammar_mask::GrammarMaskKernels as usize;
-            let opts = ::objc2_metal::MTLResourceOptions::StorageModeShared;
-            let mut grew = false;
-            let need_allow = h.allow_bits.len().max(1);
-            if self.grammar_buf_allow.is_none() || self.grammar_cap_allow < need_allow {
-                let buf = mtl_device
-                    .newBufferWithLength_options(need_allow * 4, opts)
-                    .expect("grammar allow_bits buf");
-                grammar_residency.insert(&buf);
-                self.grammar_buf_allow = Some(buf);
-                self.grammar_cap_allow = need_allow;
-                grew = true;
-            }
-            let need_rows = h.rows.len().max(1);
-            if self.grammar_buf_rows.is_none() || self.grammar_cap_rows < need_rows {
-                let buf = mtl_device
-                    .newBufferWithLength_options(need_rows * 4, opts)
-                    .expect("grammar rows buf");
-                grammar_residency.insert(&buf);
-                self.grammar_buf_rows = Some(buf);
-                self.grammar_cap_rows = need_rows;
-                grew = true;
-            }
-            if self.grammar_buf_gconsts.is_none() {
-                let buf = mtl_device
-                    .newBufferWithLength_options(2 * 4, opts)
-                    .expect("grammar gconsts buf");
-                grammar_residency.insert(&buf);
-                self.grammar_buf_gconsts = Some(buf);
-                grew = true;
-            }
-            // Commit the residency set only when a buffer was (re)allocated;
-            // steady-state steps reuse the already-pinned buffers.
+            let grew =
+                reserve_pinned(
+                    &mut self.grammar_buf_allow,
+                    &mtl_device,
+                    &residency,
+                    h.allow_bits.len().max(1) * 4,
+                ) | reserve_pinned(
+                    &mut self.grammar_buf_rows,
+                    &mtl_device,
+                    &residency,
+                    h.rows.len().max(1) * 4,
+                ) | reserve_pinned(&mut self.grammar_buf_gconsts, &mtl_device, &residency, 8);
             if grew {
-                grammar_residency.commit();
+                residency.commit();
             }
             let allow = self.grammar_buf_allow.as_ref().unwrap();
             let rows = self.grammar_buf_rows.as_ref().unwrap();
@@ -2196,9 +2062,9 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
                     .expect("grammar_mask arg_table alloc returned nil")
             };
             Some(GrammarMaskGpu {
-                allow_bits: allow.clone(),
-                rows: rows.clone(),
-                gconsts: gconsts.clone(),
+                allow_bits: (**allow).clone(),
+                rows: (**rows).clone(),
+                gconsts: (**gconsts).clone(),
                 arg_table,
                 num_rows: h.rows.len() as u32,
                 kernels_addr,
@@ -2221,12 +2087,13 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
         // sampler (cast → [penalties] → sample) onto THIS forward's command
         // buffer — in the followup, AFTER argmax — so forward + argmax + sampling
         // are ONE commit + ONE host wait, not a second `Mtl4DispatchBatch`. The
-        // `PendingSampler` moves into the closure; its output buffer is cloned
-        // out first so it can be read back after the (single) host wait below.
+        // closure only borrows the `PendingSampler`, whose buffers stay pinned
+        // while it lives, so it outlives the forward and its host wait below.
         let pending_sampler = self.pending_sampler.take();
-        let sampler_readback = pending_sampler.as_ref().map(|p| p.output());
+        let sampler = pending_sampler.as_ref();
+        let sampler_readback = sampler.map(|p| p.output());
         #[cfg(feature = "sampler-telemetry")]
-        let sampler_telem = pending_sampler.as_ref().and_then(|p| p.telemetry_output());
+        let sampler_telem = sampler.and_then(|p| p.telemetry_output());
         let sampler_kernels_addr = self
             .sampler_kernels
             .as_ref()
@@ -2342,7 +2209,7 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
                 }
                 // Fused sampler: encode cast → [penalties] → sample onto THIS
                 // encoder, after argmax, reading the (grammar-masked) logits.
-                if let Some(ref ps) = pending_sampler
+                if let Some(ps) = sampler
                     && let Some(addr) = sampler_kernels_addr
                 {
                     let kernels_ref = unsafe {
@@ -2362,50 +2229,6 @@ impl ::scratchy_serving_engine::spec_decode::SpecDecodeBackend for MetalWorker {
             )
         };
         let _ = logits; // argmax_out is what we read
-
-        // ── TurboQuant: compress this step's new KV slots in place ───────
-        // The forward above is blocking, so the new KV is written. For each
-        // layer, quantize the new slots into the packed store (~4.6x) and
-        // dequant back into the fp16 pool, so the NEXT step's attention reads
-        // TurboQuant'd KV. Target pool only; OFF unless kv_cache_dtype=turboquant.
-        if matches!(kv_pool, KvPoolHandle::TARGET)
-            && let Some(tq) = self.turboquant.as_ref()
-        {
-            let n_slots = req.num_tokens as u32;
-            // Batch ALL layers' K+V compress into ONE MTL4 command buffer
-            // (one commit, NO host wait) — the per-layer commit+wait was a
-            // ~2x decode hit (16 layers × K/V = 32 host syncs/step). The
-            // kernel reaches the pool via the chunk-table gpuAddress, so the
-            // chunk DATA buffers ride in as extra-resident (not bound) inside
-            // encode_compress_layer. slots = WINDOW slot (fp16 read),
-            // logical_slots = packed index; identical for the in-place path.
-            scratchy_target_metal::turboquant::run_compress_batch(&mtl_device, |batch| {
-                for layer in 0..tq.num_layers() {
-                    let kb: Vec<&_> = kv_cache_ref
-                        .k_chunk_bufs(layer)
-                        .iter()
-                        .map(|m| m.buffer())
-                        .collect();
-                    let vb: Vec<&_> = kv_cache_ref
-                        .v_chunk_bufs(layer)
-                        .iter()
-                        .map(|m| m.buffer())
-                        .collect();
-                    tq.encode_compress_layer(
-                        batch,
-                        layer,
-                        kv_cache_ref.k_chunk_table_mem(layer).buffer(),
-                        &kb,
-                        kv_cache_ref.v_chunk_table_mem(layer).buffer(),
-                        &vb,
-                        &buf_slot_mapping,
-                        &buf_logical_slot_mapping,
-                        n_slots,
-                    );
-                }
-            })
-            .map_err(|e| BackendError::Backend(format!("turboquant compress: {e:?}")))?;
-        }
 
         // ── 5. Read host-visible argmax buffer + return. ─────────────────
         let argmax_slice: &[u32] = unsafe {
@@ -2679,6 +2502,25 @@ impl Drop for ResidencyPanicGuard {
     }
 }
 
+/// Grow `slot` to a pinned, zeroed buffer of at least `bytes`, replacing (and
+/// so unpinning) a smaller one. Returns whether it allocated, i.e. whether
+/// `residency` needs a commit before the next command buffer.
+#[cfg(feature = "metal")]
+fn reserve_pinned(
+    slot: &mut Option<scratchy_target_metal::residency::Pinned>,
+    device: &scratchy_target_metal::mtl4_dispatch::Device,
+    residency: &scratchy_target_metal::residency::MetalResidencySet,
+    bytes: usize,
+) -> bool {
+    use ::objc2_metal::MTLBuffer;
+    if slot.as_ref().is_some_and(|p| p.length() >= bytes) {
+        return false;
+    }
+    let buffer = scratchy_target_metal::mtl4_dispatch::shared_zeroed(device, bytes);
+    *slot = Some(residency.pin(buffer));
+    true
+}
+
 #[cfg(feature = "metal")]
 /// Minimum fp16 KV footprint (bytes per token, all layers, K+V) for
 /// TurboQuant to be worth enabling by default.
@@ -2687,7 +2529,7 @@ impl Drop for ResidencyPanicGuard {
 /// is not the constraint and the trade is a bad one. Sized to sit
 /// between the models measured on metal:
 ///
-///     qwen2.5-0.5b   24 x 2 kv x 64  =  12 KiB/token   -> fp16 (garbage under TQ)
+///     qwen2.5-0.5b   24 x 2 kv x 64  =  12 KiB/token   -> fp16
 ///     llama-3.2-1b   16 x 8 kv x 64  =  32 KiB/token   -> TurboQuant
 ///     granite-4.1-3b 40 x 8 kv x 64  =  80 KiB/token   -> TurboQuant
 ///     gemma-3-4b     34 x 4 kv x 256 = 544 KiB/token   -> TurboQuant
@@ -2710,25 +2552,6 @@ impl Worker for MetalWorker {
     fn prefill_bucket_max_m(&self) -> Option<u32> {
         // Set by `determine_available_memory` from the target-reactive bucket
         // selection; the engine clamps `max_num_batched_tokens` to it.
-        //
-        // TurboQuant: cap the prefill chunk at 2048. A chunked-prefill
-        // CONTINUATION chunk in the 4096 bucket has a residual collapse past
-        // ~8k tokens (3rd+ continuation, finite K/V — a downstream compute NaN);
-        // the 2048 bucket is clean (steel, verified to 31k). Capping here makes
-        // long-context TurboQuant correct BY DEFAULT (no --max-num-batched-tokens
-        // flag). `tq_on` mirrors `initialize_cache`'s auto-enable (power-of-2
-        // head_dim <= 256) so it holds before that runs too.
-        // TODO: root-cause the bucket-4096 continuation NaN to restore the 4096
-        // chunk's prefill throughput.
-        let tq_on = self.config.kv_cache_dtype == "turboquant"
-            || (self.config.kv_cache_dtype == "auto"
-                && self.model.as_ref().is_some_and(|m| {
-                    let hd = m.head_dim() as usize;
-                    hd.is_power_of_two() && hd <= 256
-                }));
-        if tq_on {
-            return self.metal_prefill_bucket_max_m.map(|v| v.min(2048));
-        }
         self.metal_prefill_bucket_max_m
     }
 
@@ -3044,15 +2867,11 @@ impl Worker for MetalWorker {
                 } else if kv_bytes_per_token < TQ_MIN_KV_BYTES_PER_TOKEN {
                     // TurboQuant buys KV CAPACITY. A model whose whole KV
                     // row is a few KB does not need the capacity and should
-                    // not pay the fidelity risk: `qwen2.5-0.5b` (24 layers
-                    // x 2 kv x 64 = 12 KiB/token) decodes garbage under
-                    // TurboQuant at the maximum 4 bits while fp16 KV is
-                    // clean, and every component — flat kernels, paged
-                    // kernels, codebook (outliers cost nothing), tape order,
-                    // dispatch grids — measures correct in isolation. The
-                    // cause is unidentified. Compressing 12 KiB/token was never
-                    // worth it, so the honest default is fp16 and the open
-                    // question is recorded rather than papered over.
+                    // not pay the (4-bit) fidelity cost: `qwen2.5-0.5b` is
+                    // 24 layers x 2 kv x 64 = 12 KiB/token. (Its old garbage
+                    // under TurboQuant was the codec coding its `k_proj` bias
+                    // — 137x the signal on layer 0 — as signal; the KV writer
+                    // now declares that offset and the codec removes it.)
                     tracing::info!(
                         "ScratchyWorker(metal): KV is {} KiB/token ({} layers x {nkv} kv x {hd}) — \
                          below the {} KiB TurboQuant threshold, using fp16 KV \
@@ -3107,44 +2926,16 @@ impl Worker for MetalWorker {
             }
         };
 
-        // TurboQuant window (opt-in SCRATCHY_TQ_WINDOW): allocate the fp16 pool
-        // at the BOUNDED window size, not the full logical capacity — this is
-        // the resident-memory reduction. The packed store (built below) keeps
-        // the full `num_gpu_blocks` logical capacity (4.6x smaller bytes); the
-        // worker remaps logical->window every forward. capacity MUST be >= the
-        // max single-forward working set (else resolve_table self-evicts).
-        // Also require the supported geometry (power-of-2 head_dim <= 256) so an
-        // unsupported model with SCRATCHY_TQ_WINDOW set doesn't shrink the pool
-        // without the (skipped) window remap — see the tq_supported guard below.
-        let tq_window_on = self.config.kv_cache_dtype == "turboquant"
-            && std::env::var_os("SCRATCHY_TQ_WINDOW").is_some()
-            && (model.head_dim() as usize).is_power_of_two()
-            && (model.head_dim() as usize) <= 256;
-        let tq_window_blocks = std::env::var("SCRATCHY_TQ_WINDOW_BLOCKS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(num_gpu_blocks)
-            .clamp(1, num_gpu_blocks);
-        let pool_blocks = if tq_window_on {
-            tq_window_blocks
-        } else {
-            num_gpu_blocks
-        };
-        if tq_window_on {
-            info!(
-                "ScratchyWorker(metal): TurboQuant window — fp16 pool sized {pool_blocks} blocks (logical capacity {num_gpu_blocks}, packed-backed)"
-            );
-        }
         // Runtime per-sequence block-table capacity for this pool. Replaces the
         // compile-time `W::MAX_BLOCKS_PER_SEQ` (default 128 ≈ 2k tokens) so long
         // context isn't silently truncated. Stored on the pool; the host
         // block-table stride (execute_model), the kernel `MaxBlocksPerSeq`
         // function constant, and the rope-once scratch all read it back so the
-        // three agree. Capped at `pool_blocks` (the blocks actually allocated).
-        let pool_block_cap = self.kv_block_cap(pool_blocks);
+        // three agree. Capped at `num_gpu_blocks` (the blocks actually allocated).
+        let pool_block_cap = self.kv_block_cap(num_gpu_blocks);
         info!(
             "ScratchyWorker(metal): KV block-table capacity (max_blocks_per_seq) = {pool_block_cap} \
-             (max_model_len-derived, pool {pool_blocks} blocks × {} tokens/block)",
+             (max_model_len-derived, pool {num_gpu_blocks} blocks × {} tokens/block)",
             self.config.block_size,
         );
 
@@ -3272,11 +3063,11 @@ impl Worker for MetalWorker {
                 };
             let layer = scratchy_target_metal::single_buffer_kv::SingleBufferKvLayer::new(
                 &mtl_device,
+                &residency,
                 slot_chunk_bytes,
                 max_chunks,
             )
             .map_err(|e| ExecutorError::WorkerInit(format!("SingleBufferKvLayer: {e}")))?;
-            residency.insert(layer.buffer());
             single_buf_layers.push(layer);
         }
         let mb_per_layer = (chunk_bytes_logical * num_chunks_total) as f64 / (1024.0 * 1024.0);
@@ -3300,7 +3091,7 @@ impl Worker for MetalWorker {
             let n_slots = num_tensors_for_pool * 2;
             KvCachePool::new_metal_chunked(
                 num_layers_for_pool,
-                pool_blocks,
+                num_gpu_blocks,
                 self.config.block_size,
                 model.num_key_value_heads() as usize,
                 model.head_dim() as usize,
@@ -3339,16 +3130,7 @@ impl Worker for MetalWorker {
                 // Chunk-address table: `StorageModeShared` so the CPU can
                 // write the chunk gpuAddresses (`fill_chunk_tables` below).
                 // Tiny — 8 bytes/chunk — so a regular allocation is fine.
-                |bytes| {
-                    let buffer = mtl_device
-                        .newBufferWithLength_options(
-                            bytes,
-                            ::objc2_metal::MTLResourceOptions::StorageModeShared,
-                        )
-                        .expect("newBufferWithLength_options returned nil");
-                    residency.insert(&buffer);
-                    Ok(MetalMem::from_buffer(buffer))
-                },
+                |bytes| Ok(MetalMem::new_pinned(&mtl_device, &residency, bytes)),
             )
         }
         .map_err(|e| ExecutorError::WorkerInit(format!("KvCachePool: {e}")))?;
@@ -3400,17 +3182,12 @@ impl Worker for MetalWorker {
         );
         self.kv_cache = Some(pool);
 
-        // TurboQuant KV compression — gated on `kv_cache_dtype == "turboquant"`,
-        // OFF by default (the fp16 pool above is unchanged). Build the runtime
-        // (kernels + codebook + per-layer packed store); the post-forward hook
-        // then compresses each step's new KV slots into the ~4.6x packed store
-        // and dequants them back into the fp16 pool so attention reads
-        // TurboQuant'd KV. (Uniform geometry; gemma4 per-layer hybrid is a
-        // follow-up — head_dim must be a power of two.)
+        // TurboQuant KV compression (`kv_cache_dtype == "turboquant"`) is owned by
+        // the per-layer tape ops, factory-provisioned via ForwardCtx::kv_turboquant.
         // TurboQuant supports only power-of-2 head_dim <= 256 (the Walsh-Hadamard
         // rotation needs a power-of-2 length; the kernel threadgroup caps at 256
         // threads). Models like phi3 (hd 96), deepseek_v3 (hd 56), kimi_k2 (hd
-        // 112) fall OUTSIDE that — for those we must NOT build the runtime (it
+        // 112) fall OUTSIDE that — for those we must NOT enable it (it
         // would panic in PolarQuantizer); fall back to plain fp16 + warn. This is
         // what makes turboquant safe to request/default on any model.
         let tq_hd = model.head_dim() as usize;
@@ -3421,10 +3198,6 @@ impl Worker for MetalWorker {
             );
         }
         if self.config.kv_cache_dtype == "turboquant" && tq_supported {
-            // The per-layer TurboQuant tape ops (factory-provisioned via
-            // ForwardCtx::kv_turboquant) now own compress + dequant. The old
-            // in-place TurboQuantRuntime + window map are superseded;
-            // `self.turboquant` stays None so every old hook below skips.
             info!(
                 "ScratchyWorker(metal): TurboQuant — per-layer tape ops active (factory-provisioned)"
             );
@@ -3452,34 +3225,12 @@ impl Worker for MetalWorker {
                     gdn_cfg.num_v_heads as usize,
                     gdn_cfg.head_v_dim as usize,
                     gdn_cfg.head_k_dim as usize,
-                    |bytes| {
-                        // f32 conv/ssm state. MUST be StorageModeShared:
-                        // `MetalMem::from_buffer` takes `contents()` and
-                        // every per-layer conv/ssm pointer derives from
-                        // that CPU base. The old StorageModePrivate alloc
-                        // "worked" only because pre-26.5.1 drivers handed
-                        // out a CPU-mappable pointer for Private UMA
-                        // memory anyway; macOS 26.5.1 stopped doing that
-                        // for LARGE allocations (dedicated unmapped VM),
-                        // so the Qwen3.5-MoE-35B pool (~500 MB) silently
-                        // built wild per-layer addresses → garbage GDN
-                        // state → degenerate logits ("!!!!"), while small
-                        // pools (0.8B/9B, heap-suballocated and still
-                        // mapped) kept working. Metal validation layer
-                        // names it: `validateCPUWriteable` assert in
-                        // `MetalMem::from_buffer`. Shared is identical
-                        // bandwidth on UMA. Pinned into the same shared
-                        // residency set as the KV pool so the lazy pager
-                        // can't drop it mid-attention.
-                        let buffer = mtl_device
-                            .newBufferWithLength_options(
-                                bytes,
-                                ::objc2_metal::MTLResourceOptions::StorageModeShared,
-                            )
-                            .expect("GDN state buffer alloc returned nil");
-                        residency.insert(&buffer);
-                        Ok(MetalMem::from_buffer(buffer))
-                    },
+                    // f32 conv/ssm state. Every per-layer conv/ssm pointer
+                    // derives from the CPU base of this StorageModeShared
+                    // buffer (a Private one gave the Qwen3.5-MoE-35B pool wild
+                    // addresses on macOS 26.5.1). Pinned in the same set as
+                    // the KV pool so the lazy pager can't drop it mid-attention.
+                    |bytes| Ok(MetalMem::new_pinned(&mtl_device, &residency, bytes)),
                 )
             }
             .map_err(|e| ExecutorError::WorkerInit(format!("GdnStatePool: {e}")))?;
@@ -4060,7 +3811,7 @@ impl Worker for MetalWorker {
         // slot_mapping[t] = block_ids[abs_pos / bs] * bs + (abs_pos % bs)
         // u32 under metal — the macro-emitted forward reads this as
         // `&[u32]`. Rope kernel checks `slot_mapping[i] != u32::MAX`.
-        let mut slot_mapping_u32: Vec<u32> = Vec::with_capacity(num_tokens);
+        let mut slot_mapping = StepSlotMapping::with_capacity(num_tokens);
         // Spans (rope-on-read): only set bit 31 when the loaded model's
         // kernels mask it (W::ROPE_ON_READ). False for non-spans models →
         // `ann` stays None → byte-identical slot_mapping.
@@ -4085,7 +3836,7 @@ impl Worker for MetalWorker {
                 let block_idx = abs_pos / full_block_size;
                 let offset = abs_pos % full_block_size;
                 if block_idx >= block_ids.len() {
-                    slot_mapping_u32.push(u32::MAX);
+                    slot_mapping.skip();
                     continue;
                 }
                 // Phase 2: a reused cache-hit block already holds valid
@@ -4093,10 +3844,10 @@ impl Worker for MetalWorker {
                 // skip rewriting its KV (u32::MAX = the kernels' write-skip
                 // sentinel). Attention still READS it via block_table (bit 31).
                 if reused.is_some_and(|r| r.contains(&block_idx)) {
-                    slot_mapping_u32.push(u32::MAX);
+                    slot_mapping.skip();
                     continue;
                 }
-                let mut slot = (block_ids[block_idx] * full_block_size + offset) as u32;
+                let slot = block_ids[block_idx] * full_block_size + offset;
                 // ⚠️ SPANS BIT-31 CONTRACT (authoritative definition).
                 // Bit 31 of a slot_mapping / block_table entry = "this block is
                 // stored UNROTATED" (rope_append skips K-rotation; attention
@@ -4110,15 +3861,14 @@ impl Worker for MetalWorker {
                 // fused_qkv_rope_cache, fused_affine_qkv_rope_cache,
                 // turboquant.metal. Enforced by
                 // crates/targets/metal/tests/kv_index_bit31_mask_test.rs.
-                if ann.is_some_and(|a| {
+                let unrotated = ann.is_some_and(|a| {
                     a.get(&block_idx)
                         .is_some_and(scratchy_core_common::BlockKind::is_relocatable)
-                }) {
-                    slot |= 0x8000_0000;
-                }
-                slot_mapping_u32.push(slot);
+                });
+                slot_mapping.write(slot, unrotated);
             }
         }
+        let slot_mapping_u32 = slot_mapping.into_slots();
 
         // block_table padded to [num_reqs, max_blocks_per_seq] u32.
         //
@@ -4154,12 +3904,6 @@ impl Worker for MetalWorker {
         // stride keeps the host write self-consistent (the kernel would still
         // read its baked stride; this never under-runs the host buffer).
         let max_blocks_eff = kernel_block_table_stride.max(runtime_max_blocks).max(1);
-        // ⚠️ MEASURED 2026-08-11, SO THE COMMENT ABOVE IS NOT THE WHOLE STORY: forcing this stride to the
-        // kernel's own baked value (128) and to 2048 both left the 12-request repro at 1/12 — the same
-        // score as the pool value (8192). The host/kernel stride disagreement is REAL (slot 5 is baked from
-        // `W::MAX_BLOCKS_PER_SEQ` at pipelines.rs:489, not from the pool as the comment above claims) but it
-        // is NOT what corrupts a prefill that shares a step with a decode. Do not re-chase it from the
-        // comment alone.
         let mut block_table_u32: Vec<u32> = vec![0u32; num_reqs * max_blocks_eff];
         if runtime_max_blocks > 0 {
             for (i, blocks) in attn.block_ids.iter().enumerate() {
@@ -4176,7 +3920,7 @@ impl Worker for MetalWorker {
                         a.get(&j)
                             .is_some_and(scratchy_core_common::BlockKind::is_relocatable)
                     }) {
-                        entry |= 0x8000_0000;
+                        entry |= scratchy_target_metal::UNROTATED_BLOCK_BIT;
                     }
                     block_table_u32[i * max_blocks_eff + j] = entry;
                 }
@@ -4223,7 +3967,7 @@ impl Worker for MetalWorker {
         let mut sliding_block_tables_u32: Vec<Vec<u32>> =
             Vec::with_capacity(attn.sliding_groups.len());
         for sliding in &attn.sliding_groups {
-            let mut sm: Vec<u32> = Vec::with_capacity(num_tokens);
+            let mut sm = StepSlotMapping::with_capacity(num_tokens);
             // `i` indexes tokens_before / q_lens / sliding in lockstep.
             #[allow(clippy::needless_range_loop)]
             for i in 0..num_reqs {
@@ -4235,9 +3979,9 @@ impl Worker for MetalWorker {
                     let block_idx = abs_pos / block_size;
                     let offset = abs_pos % block_size;
                     if block_idx < block_ids.len() {
-                        sm.push((block_ids[block_idx] * block_size + offset) as u32);
+                        sm.write(block_ids[block_idx] * block_size + offset, false);
                     } else {
-                        sm.push(u32::MAX);
+                        sm.skip();
                     }
                 }
             }
@@ -4252,7 +3996,7 @@ impl Worker for MetalWorker {
                     bt[i * max_blocks_eff + j] = bid as u32;
                 }
             }
-            sliding_slot_mappings_u32.push(sm);
+            sliding_slot_mappings_u32.push(sm.into_slots());
             sliding_block_tables_u32.push(bt);
         }
         // Borrowed views for the per-group ForwardArgmaxRequest fields.
@@ -4809,18 +4553,17 @@ impl Worker for MetalWorker {
                                 + spec9_k_thread + 1;
                             let block_idx = chain_pos / spec9_block_size_thread;
                             let offset = chain_pos % spec9_block_size_thread;
-                            let slot = if block_idx
-                                < spec9_block_ids_thread.len()
-                            {
-                                spec9_block_ids_thread[block_idx]
-                                    * spec9_block_size_thread as u32
-                                    + offset as u32
-                            } else {
-                                u32::MAX
-                            };
+                            let mut spec_slot = StepSlotMapping::with_capacity(1);
+                            match spec9_block_ids_thread.get(block_idx) {
+                                Some(&block) => spec_slot.write(
+                                    block as usize * spec9_block_size_thread + offset,
+                                    false,
+                                ),
+                                None => spec_slot.skip(),
+                            }
                             let spec_input_ids: Vec<u32> = vec![spec_seeds[0]];
                             let spec_positions: Vec<u32> = vec![chain_pos as u32];
-                            let spec_slot: Vec<u32> = vec![slot];
+                            let spec_slot: Vec<u32> = spec_slot.into_slots();
                             let spec_cu: Vec<u32> = vec![0, 1];
                             let spec_su: Vec<u32> = vec![(chain_pos + 1) as u32];
                             let spec_req =
@@ -5235,6 +4978,8 @@ impl Worker for MetalWorker {
         self.kv_cache = None; // drops the file-backed store(s) → Drop msyncs their codes
         self.model = None;
         self.argmax_kernels = None;
+        self.argmax_out = None;
+        self.argmax_consts = None;
         #[cfg(feature = "guided-decoding")]
         {
             self.grammar_mask_kernels = None;
@@ -5242,8 +4987,6 @@ impl Worker for MetalWorker {
             self.grammar_buf_allow = None;
             self.grammar_buf_rows = None;
             self.grammar_buf_gconsts = None;
-            self.grammar_cap_allow = 0;
-            self.grammar_cap_rows = 0;
             self.grammar_states.clear();
             self.grammar_factory = None;
         }
@@ -5337,3 +5080,32 @@ impl crate::worker_factory::WorkerFactory for MetalWorkerFactory {
 
 #[cfg(feature = "metal")]
 inventory::submit!(&MetalWorkerFactory as &dyn crate::worker_factory::WorkerFactory);
+
+#[cfg(all(test, feature = "metal"))]
+mod tests {
+    use super::StepSlotMapping;
+
+    /// A slot two sequences write in one step keeps its first writer; the later
+    /// write becomes the skip sentinel. A span (unrotated) write of the same
+    /// slot counts as the same slot.
+    #[test]
+    fn a_slot_written_twice_in_a_step_keeps_its_first_writer() {
+        let mut step = StepSlotMapping::with_capacity(9);
+        for (slot, unrotated) in [(64, false), (65, false)] {
+            step.write(slot, unrotated);
+        }
+        step.skip();
+        for (slot, unrotated) in [(64, false), (65, false), (66, true)] {
+            step.write(slot, unrotated);
+        }
+        step.skip();
+        for (slot, unrotated) in [(66, false), (67, false)] {
+            step.write(slot, unrotated);
+        }
+        let (skip, span) = (u32::MAX, scratchy_target_metal::UNROTATED_BLOCK_BIT);
+        assert_eq!(
+            step.into_slots(),
+            [64, 65, skip, skip, skip, 66 | span, skip, skip, 67]
+        );
+    }
+}

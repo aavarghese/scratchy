@@ -717,18 +717,53 @@ fn pointwise_extents_agree(
     Ok(())
 }
 
+/// WHICH AXIS a pointwise operand is broadcast along.
+///
+/// The two are not interchangeable and the device says which through a different [`In`] builder, so
+/// they are a variant rather than a `bool`: [`In::col`] marks the operand out-broadcast (a per-row
+/// scalar sprayed along the stick axis) and [`In::mb`] marks it mb-broadcast (a row vector sprayed
+/// down the rows). Emitting one for the other reads a `[m, 1]` operand as a `[1, n]` and takes the
+/// wrong bytes for every row after the first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BcastAxis {
+    /// `[m, 1]` → `[m, n]`: a per-row scalar (a row reduction's result) sprayed along the columns.
+    /// The softmax's `m[:, None]` and `l[:, None]`.
+    Col,
+    /// `[1, n]` → `[m, n]`: a row vector (an rmsnorm gain) sprayed down the rows. `n1[None, :]`.
+    Mb,
+}
+
 /// main's `lower_elementwise_node` (main 8362-8432). Its door: the [`Elementwise`] kind is stated by
 /// the caller, the operand names are the parameters, and the row count is the node's ([`node_rows`] —
 /// the producer row-blocks a region wider than the LX holds, so the first window is not the node).
+///
+/// `bcast[i]` is the axis input `i` is broadcast along, `None` for a dense operand. The caller proves
+/// it from the program (see `whole_function::program_broadcast_chains`, which reads the
+/// `expand_shape`'s degenerate dim and cross-checks the `linalg.broadcast`'s `Dimensions`, then
+/// checks the axis against the resolved source's own extent). An empty slice means "no operand is
+/// broadcast", which is every existing caller.
 pub fn elementwise(
     name: &str,
     kind: Elementwise,
     r: &[Region],
+    bcast: &[Option<BcastAxis>],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
     let (op_func, arity) = elementwise_op_func(name, kind)?;
     let (ins, out) = split_out(name, r, layout, arity)?;
+    if !bcast.is_empty() && bcast.len() != ins.len() {
+        return err(format!(
+            "Elementwise({kind:?}) {name}: {} broadcast flags for {} inputs — the flags are \
+             POSITIONAL (flag `i` selects input `i`'s operand mode), so a length mismatch would \
+             address some other operand as the vector",
+            bcast.len(),
+            ins.len(),
+        ));
+    }
+    if bcast.iter().any(Option::is_some) {
+        return elementwise_broadcast(name, kind, &ins, &out, bcast, sym_id_base, layout);
+    }
     pointwise_extents_agree(name, kind, &ins, &out)?;
     // ⛔ THIS COMMENT USED TO SAY `assemble_pointwise` EMITS THE SFP POLYNOMIAL TABLE "via
     // `constant_info(op_func)`". THERE IS NO SUCH FUNCTION. `constant_info` is a local in `emit_sdsc`
@@ -756,6 +791,123 @@ pub fn elementwise(
         layout,
     );
     Ok(vec![op])
+}
+
+/// ⭐⭐⭐ [`elementwise`] WITH A BROADCAST OPERAND — the arm [`pointwise_extents_agree`] names in its
+/// own refusal, now built.
+///
+/// A broadcast is an ADDRESSING MODE, not an op: the AIU has no broadcast primitive and needs none.
+/// [`EwOperand::scale`] turns [`In::col`] into `out = Scale::RedStick` (a one-stick `alpha_=0`
+/// broadcast READ) and [`In::mb`] into `mb = Scale::RedNonStick`, so the DESCRIPTOR states which axis
+/// is sprayed and the operand is read at its own extent instead of the output's. That is the whole
+/// difference from the seeded path, which computes `device_dims` once off the output tile and hands
+/// the same dims to every operand — which is why it has to refuse a degenerate one.
+///
+/// This is the same emission the hardware-proven bodies already use: `rmsnorm.rs` reads
+/// `In::col(&rinv)` for the per-row `1/rms` and `In::mb(&gamma)` for the `[1, cols]` gain, and
+/// `attn.rs`'s softmax reads `In::col(&hm(run_m))` for the per-row max. So the softmax a KTIR producer
+/// spells longhand lowers to the operand modes the fused body was already proving on card.
+///
+/// ⭐ THE OPERAND'S BUFFER IS ALREADY STICK-WIDE, which is what makes a `[m, 1]` region addressable
+/// as a per-row scalar. [`synth_footprint_bytes`](crate::placement::synth_footprint_bytes) rounds the
+/// INNER extent up to a whole stick, so the `[m, 1]` intermediate a row reduction writes reserves
+/// `m × 64` fp16 — byte-identical to the `rb(name, rows, 64)` handle `rmsnorm.rs` mints for `rinv`.
+/// The per-row value sits in lane 0 of each row and `Scale::RedStick` reads exactly that.
+///
+/// ⛔ THE EXTENTS ARE RE-CHECKED HERE, NOT TRUSTED. The caller proves the axis from the program's
+/// attributes; this door proves it from the operand's REGION. The two are independent, and the
+/// emission is only correct when both hold — a `Col` flag over an operand that is really `[m, n]`
+/// would read one lane and spray it over the whole output, silently.
+fn elementwise_broadcast(
+    name: &str,
+    kind: Elementwise,
+    ins: &[Region],
+    out: &Region,
+    bcast: &[Option<BcastAxis>],
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<Vec<EmittedOp>, Error> {
+    // THE OP FUNC IS A FUNCTION OF THE KIND, so it is named here rather than passed. The caller holds
+    // it already, but [`elementwise_op_func`] is that one `match` and nothing else, so handing it over
+    // as well would buy a parameter and no fact — and the call already proved it Ok for this `kind`.
+    let (op_func, _) = elementwise_op_func(name, kind)?;
+    // ⛔ A UNARY'S ONLY INPUT CANNOT BE THE BROADCAST. `f(vector) -> tile` is not a pointwise op at
+    // all — it is a broadcast MATERIALIZATION with an `f` applied, and emitting it as one would put
+    // the whole output's worth of work on a descriptor whose only input is one lane per row. Nothing
+    // produces it, so it is named rather than given a meaning here.
+    if ins.len() < 2 {
+        return err(format!(
+            "Elementwise({kind:?}) {name}: the only input of a unary op is marked broadcast, so the \
+             output would be a SPRAY of a vector rather than a function of a tile. A broadcast is an \
+             operand mode of an op that also reads a dense operand; a materialization is a different \
+             op and this door does not invent one"
+        ));
+    }
+    // EVERY OPERAND'S EXTENT AGAINST WHAT ITS FLAG CLAIMS — the dense ones at the output's extent
+    // (the law [`pointwise_extents_agree`] states), the broadcast ones degenerate on the sprayed axis
+    // and matching the output on the other. A `Col` operand must still have the output's ROW count:
+    // it supplies one value per row, so a different row count would run off its end exactly as a
+    // dense mismatch does.
+    for (i, x) in ins.iter().enumerate() {
+        let want = match bcast[i] {
+            None => (out.v_rows, out.c_len),
+            Some(BcastAxis::Col) => (out.v_rows, 1),
+            Some(BcastAxis::Mb) => (1, out.c_len),
+        };
+        if (x.v_rows, x.c_len) != want {
+            return err(format!(
+                "Elementwise({kind:?}) {name}: input {i} t{} is `[{}, {}]` but its operand mode \
+                 ({:?}) requires `[{}, {}]` against the `[{}, {}]` output t{}. A `Col` operand is one \
+                 value per row (`[rows, 1]`), an `Mb` operand one row of values (`[1, cols]`), and a \
+                 dense operand the whole tile; the descriptor addresses it as its mode says, so an \
+                 extent that disagrees reads bytes nobody wrote.",
+                x.tid, x.v_rows, x.c_len, bcast[i], want.0, want.1, out.v_rows, out.c_len, out.tid,
+            ));
+        }
+    }
+    let cols = out.c_len;
+    check_pointwise_cols(cols, "Elementwise", out.tid)?;
+    let rows = node_rows(name, out)?;
+    let op_name = format!("{op_func}_o{}", out.tid);
+    // The handles: `rb` is RowBlocked, which is what `head_major == false` means on the seeded path —
+    // the residual token stream, not the per-head attention layout. An INPUT handle's extents are
+    // annotation-only (`In::ew` keeps the name and the two broadcast flags), and the OUTPUT's are too
+    // (the builder reads `o.name()` and `O::kind()`), so the emission cannot depend on them; they are
+    // stated at the operand's own shape so a reader is not misled.
+    let out_h = rb(&out.name(), rows, cols);
+    let in_names: Vec<String> = ins.iter().map(Region::name).collect();
+    let in_handles: Vec<_> = in_names
+        .iter()
+        .zip(ins)
+        .map(|(n, x)| rb(n, x.v_rows, x.c_len))
+        .collect();
+    let ew: Vec<_> = in_handles
+        .iter()
+        .zip(bcast)
+        .map(|(h, b)| match b {
+            None => In::full(h).ew(),
+            Some(BcastAxis::Col) => In::col(h).ew(),
+            Some(BcastAxis::Mb) => In::mb(h).ew(),
+        })
+        .collect();
+    // The SAME `TileOp` the dense arm builds, so the two arms share one LX-tiling contract and a
+    // broadcast op is not silently exempt from it.
+    let tile_op = pointwise_tile_op(rows, cols, ins.len() as u32 + 1);
+    Ok(vec![assemble_pointwise_broadcast_off_from_tile(
+        &op_name,
+        &tile_op,
+        op_func,
+        rows,
+        cols,
+        &ew,
+        &out_h,
+        // WHOLE-TENSOR, like the dense arm: this door's regions are un-windowed (its caller refuses a
+        // column corner), so there is no chunk offset to apply. A column-blocked broadcast op would
+        // need `crate::addr::col_of` here, as `silumul` does.
+        0,
+        sym_id_base,
+        layout,
+    )])
 }
 
 /// main's `lower_silumul_node` (main 8466-8604): `out = silu(gate) · up` DECOMPOSED into two
@@ -1165,20 +1317,6 @@ pub fn scalarmul(
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
 ) -> Result<Vec<EmittedOp>, Error> {
-    // ⭐ AND WHETHER THE TILE IT MULTIPLIES IS **GATHERED** is the program's statement, not the
-    // caller's. `Program::ScalarMul` is the kind of the one COMPUTE op; a Triton embedding is exactly
-    // that op over a row tile whose row INDEX is data (`embedding.py`'s
-    // `rows = table_desc.gather(ids, 0)` then `rows * EMB_SCALE`), so the gather is addressing that
-    // rides on this same node rather than a different node kind.
-    //
-    // `None` for every program that states no `ktdp.construct_indirect_access_tile`, and then `skip` is
-    // empty and [`split_out_excluding`] IS [`split_out`].
-    let gather = gather_of(k)?;
-    // The index parameter is an ADDRESSING operand, so it is not one of the op's tensor inputs — the
-    // arity stated below is still 1 (the tile), which is the whole point of excluding it by tid rather
-    // than by relaxing the count. See [`split_out_excluding`].
-    let skip: Vec<u32> = gather.iter().map(|g| g.index_tid).collect();
-    let (ins, out) = split_out_excluding(name, r, layout, 1, &skip)?;
     // ⭐⭐⭐ THE MULTIPLIER COMES FROM THE PROGRAM, like the epsilon and the attention scale. It was
     // `KtirNode::scalarmul_scale_idx`, a slot the producer resolved and hung on the node — so the
     // number the emulator multiplies by and the number the descriptor multiplies by were two facts
@@ -1192,151 +1330,14 @@ pub fn scalarmul(
              by the same value."
         ),
     })?;
-    let idx = scale_slot(layout, scale).ok_or_else(|| Error {
-        message: format!(
-            "ScalarMul {name}: multiplier {scale}, read off the program, is absent from \
-             `BundleLayout::scalarmul_scales` — the descriptor multiplies by a bound `[1,1]` const, so \
-             the value the program uses must have a registry slot (registry desync)"
-        ),
-    })?;
-    let x = ins[0].name();
-    let out_name = out.name();
-    let rows = node_rows(name, &out)?;
-    // DEVICE width (the padding invariant): a ScalarMul on the padded logits `[.,49159]` must use the SAME
-    // device width its producer matmul emitted (49664), not the logical 49159 (whose sub-stick 7 the dxp
-    // scheduler rejects). `for_pointwise` == the producer's `for_output` for macs≥2^20 producers. A no-op
-    // for 64-aligned tensors (residual/embedding [.,4096]).
+    // ⭐ AND WHETHER THE TILE IT MULTIPLIES IS **GATHERED** is the program's statement, not the
+    // caller's. `Program::ScalarMul` is the kind of the one COMPUTE op; a Triton embedding is exactly
+    // that op over a row tile whose row INDEX is data (`embedding.py`'s
+    // `rows = table_desc.gather(ids, 0)` then `rows * EMB_SCALE`), so the gather is addressing that
+    // rides on this same node rather than a different node kind.
     //
-    // ⛔ AND THE PAD IS ONLY REAL IF SOMETHING RESERVED IT — capped at the width the OUTPUT's placement
-    // actually holds. See [`pointwise_width_the_output_holds`].
-    let cols = pointwise_width_the_output_holds(
-        layout,
-        &[&out_name, &x],
-        rows,
-        DeviceWidth::for_pointwise(out.c_len).get(),
-    );
-    let scale_name = crate::place::act_name(scalarmul_scale_tid(idx));
-    let op_name = format!("scalarmul_o{}", out.tid);
-    let x_h = rbo(&x);
-    let scale_h = rbo(&scale_name);
-    let inputs = [In::full(&x_h).ew(), In::scalar(&scale_h).ew()];
-    // ⭐ THE SAME `TileOp` `node_to_tile_ops`' ScalarMul arm declares: `out` at the DEVICE width
-    // computed above, `n_operands: 2` (the scalar rides in the op, not as a tiled operand).
-    let mut tile_op = pointwise_tile_op(rows, cols, 2);
-    tile_op.kind = TileOpKind::PointwiseOrReduce { n_operands: 2 };
-    // ⭐⭐⭐ THE GATHERED FORM IS THE SAME OP WITH AN INDEX OPERAND ON THE TABLE — not a different
-    // `opFuncName`. The shipped `dxp/test/test_gather_1core/sdsc_1.json` is an ordinary `identity`
-    // carrying one extra `labeledDs_` and one extra `computeOp_` field, so nothing about the multiply
-    // changes; `assemble_pointwise_broadcast_gather` adds the index through the ONE door
-    // (`OpSpec::attach_gather_index`) every other gather in this crate goes through.
-    //
-    // ⛔ AND THE PROGRAM'S OWN ENTRY COUNT IS CHECKED AGAINST THE DESCRIPTOR'S ROW COUNT, because the
-    // two are the same fact stated twice: one index per gathered row. The index vector is described
-    // rank-1 over the op's `mb`, so a program whose indirect tile takes a different number of entries
-    // than the node has rows would be described with an index vector of the WRONG LENGTH — and the
-    // length is what the idx→address program iterates.
-    if let Some(g) = gather {
-        if g.value_tid != ins[0].tid {
-            return err(format!(
-                "{name}: the program gathers t{} but this node's tile operand is t{} — the index \
-                 operand must sit immediately after the tensor it indexes, so a gather of a tensor this \
-                 op does not read has no position in the descriptor.",
-                g.value_tid, ins[0].tid,
-            ));
-        }
-        // ⛔⛔⛔ THE GATHER'S ENTRIES MUST **TILE** THE NODE, AND THE INDEX BUFFER MUST HOLD ONE INDEX
-        // PER NODE ROW. Two separate facts, and neither is the other.
-        //
-        // The program states ONE work item: `embedding.py` reads `start_m = tl.program_id(0)` and takes a
-        // `[BLOCK_M, D_MODEL]` tile, so its indirect access tile says BLOCK_M entries. [`node_rows`]
-        // meanwhile reports the OUTPUT VIEW's full row extent, because that is what the emitted
-        // descriptor spans — the same fold every other body here performs (a row-blocked program states
-        // `ceil(m/blk)` windows and one descriptor computes all of them). So the two numbers differ by
-        // exactly the grid, and requiring them EQUAL would refuse the fold rather than check it.
-        //
-        // What has to hold instead is that the work items TILE the node (`rows % entries == 0`), exactly
-        // as `node_rows` requires of the store windows — and, because the index operand is described
-        // rank-1 over the op's `mb`, that the INDEX BUFFER really holds `rows` indices. That second one
-        // is the load-bearing check: the descriptor makes the idx→address program iterate `mb`
-        // addresses, so an id buffer shorter than the node's rows would convert past its own end and
-        // gather from whatever follows it. It is read off the index parameter's OWN view, which is the
-        // only statement of that buffer's length anywhere in the program.
-        if g.entries == 0 || !rows.is_multiple_of(g.entries) {
-            return err(format!(
-                "{name}: the indirect access tile takes {} entries and the node writes {rows} row(s), \
-                 which {} does not divide. The emitted descriptor spans the whole node, so the work \
-                 items have to TILE it — the same obligation `node_rows` puts on the store windows.",
-                g.entries, g.entries,
-            ));
-        }
-        let idx_r = r.iter().find(|x| x.tid == g.index_tid).ok_or_else(|| Error {
-            message: format!(
-                "{name}: the program gathers through t{}, which is not one of this node's parameters — \
-                 an index buffer with no binding has no placement and no stated length",
-                g.index_tid
-            ),
-        })?;
-        let idx_len = (idx_r.v_rows as u64) * (idx_r.v_cols as u64);
-        if idx_len != rows as u64 {
-            return err(format!(
-                "{name}: the index buffer t{} states a `[{}, {}]` view — {idx_len} index(es) — while \
-                 this descriptor gathers {rows} row(s). The index operand is described rank-1 over the \
-                 op's `mb`, so dbo's idx→address program converts exactly {rows} entries: a shorter \
-                 buffer is read past its end and the surplus rows gather from whatever is placed next. \
-                 Emit one node per work item, or bind an index buffer covering the node.",
-                g.index_tid, idx_r.v_rows, idx_r.v_cols,
-            ));
-        }
-        // ⛔⛔⛔ THE TABLE GOES **LAST**, AND THE SWAP IS THE ONE THING THIS BRANCH DOES TO ITS OPERANDS.
-        //
-        // Two placement laws have to hold at once and they coincide at exactly one position. The index
-        // is inserted immediately BEFORE THE OUTPUT (`attach_gather_index`, which is the vendor's
-        // `[input, index, output]` order and what keeps the output last however many operands are
-        // added); dbo separately needs the index to sit NEXT TO the tensor it indexes, or the gathered
-        // operand's use precedes the idx→address program's definition and
-        // `DSC2ToDataflowIR.cpp:51` reports `operand #1 does not dominate this use`. Both hold only
-        // when the gathered tensor is the LAST input.
-        //
-        // The ungathered order above is `[table, scalar]`, which would emit `[table, scalar, idx, out]`
-        // — index at 2, table at 0, non-adjacent. Swapping to `[scalar, table]` emits
-        // `[scalar, table, idx, out]`: adjacent AND output-last.
-        //
-        // ⭐ AND IT IS FREE HERE BECAUSE THE OP IS `multiply`, which is commutative — the SAME two
-        // operands and the same `opFuncName`, in the other order. This is not a general licence: a
-        // non-commutative pointwise gathering a non-last operand has no such swap, which is why
-        // `assemble_pointwise_broadcast_gather` REFUSES that rather than reordering on the caller's
-        // behalf.
-        let gathered_inputs = [In::scalar(&scale_h).ew(), In::full(&x_h).ew()];
-        return crate::emit::assemble_pointwise_broadcast_gather(
-            crate::emit::PointwiseGather {
-                op_name: &op_name,
-                tile_op: &tile_op,
-                op_func: "multiply",
-                rows,
-                cols,
-                inputs: &gathered_inputs,
-                gathered_input: 1,
-                index_name: &crate::place::act_name(g.index_tid),
-                o: &rbo(&out_name),
-            },
-            sym_id_base,
-            layout,
-        )
-        .map(|op| vec![op])
-        .map_err(Error::from);
-    }
-    Ok(vec![assemble_pointwise_broadcast_off_from_tile(
-        &op_name,
-        &tile_op,
-        "multiply",
-        rows,
-        cols,
-        &inputs,
-        &rbo(&out_name),
-        0,
-        sym_id_base,
-        layout,
-    )])
+    // `None` for every program that states no `ktdp.construct_indirect_access_tile`.
+    scalarmul_at(name, scale, gather_of(k)?, r, sym_id_base, layout)
 }
 
 /// A KV HEAD INDEX, TYPED, from a loop counter — the one place a bare `usize` becomes a [`KvHead`].
@@ -3704,7 +3705,7 @@ pub fn transpose(
 ) -> Result<Vec<EmittedOp>, Error> {
     let (ins, out) = split_out(name, r, layout, 1)?;
     let a = ins[0];
-    // The INPUT's view IS the op's `[mb, out]`: `assemble_transpose` iterates the input shape and the
+    // The INPUT's view IS the op's `[rows, cols]`: the builder iterates the input shape and the
     // output is its transpose. Read from the input so the two cannot be read from the same place and
     // agree vacuously.
     let (mb, cols) = (a.v_rows, a.v_cols);
@@ -3714,9 +3715,9 @@ pub fn transpose(
     if mb == 0 || cols == 0 || !mb.is_multiple_of(stk) || !cols.is_multiple_of(stk) {
         return err(format!(
             "{name}: transposing t{} `[{mb}, {cols}]` into t{} `[{cols}, {mb}]` — BOTH extents must \
-             be whole multiples of the {stk}-element SEN169_FP16 stick and {} is not. An \
-             `interslicetranspose_fp16` sticks its input on the column extent and its output on the \
-             8x8 inter-slice block over (columns, rows), so each extent is a stick extent of one side; \
+             be whole multiples of the {stk}-element SEN169_FP16 stick and {} is not. This relayout \
+             sticks its INPUT on the column extent and its OUTPUT on the row extent — the two axes \
+             swap, which is the transposition — so each extent is a stick extent of one side; \
              a sub-stick tile is refused by the dxp scheduler (L3DlOpsScheduler:1040), and the on-card \
              ReStickify that was asked for the per-step `[1, {stk}]` key anyway wrote the SECOND \
              transposed stick wrong and garbled decode past {stk} tokens. Pad the offending extent up \
@@ -3755,7 +3756,7 @@ pub fn transpose(
         if x.c_start != 0 || x.c_len != x.v_cols {
             return err(format!(
                 "{name}: the {role} t{} takes columns {}..{} of its `[{}, {}]` view — \
-                 `assemble_transpose` names a tensor and its two extents, with no column corner and \
+                 the relayout builder names a tensor and its two extents, with no column corner and \
                  no window, so it transposes the WHOLE buffer. Materialize the window first.",
                 x.tid,
                 x.c_start,
@@ -3782,12 +3783,26 @@ pub fn transpose(
             a.tid, a.r_cover.0, a.r_cover.1,
         ));
     }
+    // ⛔⛔⛔ THE RELAYOUT GOES OUT ON THE **RESTICKIFY** DOOR, NOT ON `OpFunc::Transpose`.
+    //
+    // `interslicetranspose_fp16` is the op named for this job and it CANNOT BE TRANSLATED at the
+    // default RCUDD1A arch, at any shape. Its output stick is the 8×8 inter-slice block over
+    // (`out`, `mb`) — TWO dims — and `Ddc::transformForInterSliceRestickify` turns a relayout's output
+    // stick into a dynamic mask over the innermost loop carrying `outputStickDimOrder[0]`, which for a
+    // 2-D tile is the FUSED `loop_dsX_dsY_out_mb`; `SNComputeLowering::constructDynamicMasking` accepts
+    // one loop carrying ONE dim (`SNComputeLowering.cpp:74`). Measured through `dxp_standalone`: every
+    // shape refuses there, including shapes whose core division splits both axes like the golden
+    // `sdsc_interslicetranspose.json` — which is what ruled the core division out as the cause.
+    // `OpFunc::Restickify` does the SAME transposition with a one-dim output stick and is accepted.
+    // See `super::restickify_transpose_opspec_2d`, which states the addressing argument in full, and
+    // `tests/zz_the_transpose_door_carries_a_two_dim_output_stick.rs`, which pins both doors' output sticks.
+    //
     // ⛔ THE FALLIBLE FORM, because the builder makes a refusal this body cannot pre-check: the
-    // per-core division must land on the output's 8×8 block, and what the division IS depends on
-    // `distribute_cores`' answer for this shape. Restating that here would mean duplicating the
-    // divider; calling the panicking `assemble_transpose` would abort the build with a bare panic
-    // where a producer needs an error against its own op. See `super::try_assemble_transpose`.
-    super::try_assemble_transpose(
+    // per-core tile must fit LX and this door cannot time-tile, and what the per-core tile IS depends
+    // on `distribute_cores`' answer for this shape. Restating that here would mean duplicating the
+    // divider; a panicking assembler would abort the build with a bare panic where a producer needs an
+    // error against its own op.
+    super::try_assemble_restickify_transpose_2d(
         &format!("transpose_o{}", out.tid),
         mb,
         cols,
@@ -3911,7 +3926,7 @@ mod elementwise_tests {
         );
         let mut sym = 0i64;
         // `EmittedOp` is not `Debug`, so `expect_err` is unavailable — bind the refusal directly.
-        let Err(e) = elementwise("add_s3", Elementwise::Add, &r, &mut sym, None) else {
+        let Err(e) = elementwise("add_s3", Elementwise::Add, &r, &[], &mut sym, None) else {
             panic!("a [1,128] operand under a [4,128] output cannot be addressed here");
         };
         assert!(e.message.contains("t6"), "names the operand: {}", e.message);
@@ -3938,7 +3953,7 @@ mod elementwise_tests {
             reg(7, 4, 128, true),
         );
         let mut sym = 0i64;
-        let ops = elementwise("add_s3", Elementwise::Add, &r, &mut sym, None)
+        let ops = elementwise("add_s3", Elementwise::Add, &r, &[], &mut sym, None)
             .expect("agreeing extents are the ordinary case");
         assert_eq!(ops.len(), 1, "one pointwise op, not a decomposition");
     }
@@ -3955,7 +3970,7 @@ mod elementwise_tests {
             reg(7, 4, 128, true),
         );
         let mut sym = 0i64;
-        let Err(e) = elementwise("sub_s3", Elementwise::Sub, &r, &mut sym, None) else {
+        let Err(e) = elementwise("sub_s3", Elementwise::Sub, &r, &[], &mut sym, None) else {
             panic!("a [4,1] per-row scalar is a broadcast this path cannot state");
         };
         assert!(e.message.contains("t6"), "names the operand: {}", e.message);
@@ -3971,7 +3986,7 @@ mod elementwise_tests {
     fn a_unary_input_of_the_wrong_extent_is_refused() {
         let r = vec![reg(5, 1, 128, false), reg(7, 4, 128, true)];
         let mut sym = 0i64;
-        let Err(e) = elementwise("silu_s3", Elementwise::Silu, &r, &mut sym, None) else {
+        let Err(e) = elementwise("silu_s3", Elementwise::Silu, &r, &[], &mut sym, None) else {
             panic!("a unary's input extent must match its output too");
         };
         assert!(e.message.contains("t5"), "names the operand: {}", e.message);
@@ -3988,10 +4003,157 @@ mod elementwise_tests {
             reg(7, 4, 128, true),
         );
         let mut sym = 0i64;
-        let ops = elementwise("sub_s3", Elementwise::Sub, &r, &mut sym, None)
+        let ops = elementwise("sub_s3", Elementwise::Sub, &r, &[], &mut sym, None)
             .expect("a same-extent subtract is structurally an add");
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].op_name, "sub_o7");
+    }
+
+    // ── THE BROADCAST ARM, AND EVERY REFUSAL AROUND IT ────────────────────────────────────────
+    //
+    // ⭐⭐⭐ THE SOFTMAX IS WHY THIS ARM EXISTS. `decoder_layer_one_flat`'s `Elementwise(Sub)` takes the
+    // per-row max as a `[64, 1]` operand and its `Elementwise(RealDiv)` takes the per-row sum the same
+    // way; both were REFUSED by `pointwise_extents_agree`, correctly, because the seeded whole-tensor
+    // builder addresses every operand at the OUTPUT's extent. `In::col` states the broadcast instead,
+    // which is the builder that refusal has always named. MEASURED on card once this landed (with the
+    // transpose rerouted and the ScalarMul scales bound): `decoder_layer_one_flat` max|err| 0.0306 =
+    // 0.783 % of full scale over a 52-op chain, within_2pct_strict (floor 1e-3) 0.8937;
+    // `decoder_two_layers_flat` 0.0343 = 0.800 % FS over 104 ops, 0.8458 strict. The STRICT figure is
+    // quoted because it is the one that reproduces: the max errors reproduce exactly, a looser
+    // denominator did not.
+
+    /// ⭐ THE PER-ROW SCALAR NOW EMITS — one op, still named `sub_o7`, when the caller STATES the axis.
+    /// Its twin above (`a_per_row_scalar_operand_is_still_refused`) is the control: the SAME regions
+    /// with NO flag still refuse, so the flag is what admits it and not a loosened extent law.
+    #[test]
+    fn a_stated_col_broadcast_operand_emits_one_op() {
+        let r = node(
+            reg(5, 4, 128, false),
+            reg(6, 4, 1, false),
+            reg(7, 4, 128, true),
+        );
+        let mut sym = 0i64;
+        let ops = elementwise(
+            "sub_s3",
+            Elementwise::Sub,
+            &r,
+            &[None, Some(BcastAxis::Col)],
+            &mut sym,
+            None,
+        )
+        .expect("a [m, 1] per-row scalar IS expressible once the axis is stated");
+        assert_eq!(ops.len(), 1, "an operand mode is not a decomposition");
+        assert_eq!(
+            ops[0].op_name, "sub_o7",
+            "the descriptor NAME must not change with the operand mode — it feeds the bundle \
+             fingerprint, and the broadcast arm is the same op",
+        );
+    }
+
+    /// ⭐ AND THE ROW VECTOR TOO, through the OTHER builder. `Mb` is why [`BcastAxis`] is a variant
+    /// rather than a bool: an rmsnorm gain is `[1, n]` and reading it as `[m, 1]` would take one column
+    /// and spray it.
+    #[test]
+    fn a_stated_mb_broadcast_operand_emits_one_op() {
+        let r = node(
+            reg(5, 4, 128, false),
+            reg(6, 1, 128, false),
+            reg(7, 4, 128, true),
+        );
+        let mut sym = 0i64;
+        let ops = elementwise(
+            "mul_s3",
+            Elementwise::Mul,
+            &r,
+            &[None, Some(BcastAxis::Mb)],
+            &mut sym,
+            None,
+        )
+        .expect("a [1, n] row vector is the mb-broadcast operand mode");
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].op_name, "multiply_o7");
+    }
+
+    /// ⛔⛔⛔ THE AXIS AND THE EXTENT MUST AGREE, and this is the refusal that makes the flag a
+    /// STATEMENT rather than a licence. A `Col` flag over an operand that is really the whole tile
+    /// would address one lane per row and spray it over 128 columns — a silently wrong answer with no
+    /// shape error anywhere, which is exactly what the seeded path's own refusal exists to prevent.
+    #[test]
+    fn a_col_flag_over_a_full_tile_is_refused_by_name() {
+        let r = node(
+            reg(5, 4, 128, false),
+            reg(6, 4, 128, false),
+            reg(7, 4, 128, true),
+        );
+        let mut sym = 0i64;
+        let Err(e) = elementwise(
+            "sub_s3",
+            Elementwise::Sub,
+            &r,
+            &[None, Some(BcastAxis::Col)],
+            &mut sym,
+            None,
+        ) else {
+            panic!(
+                "a Col flag over a [4, 128] operand was ACCEPTED — the descriptor now reads one lane \
+                 per row and sprays it, and nothing downstream can tell"
+            );
+        };
+        assert!(e.message.contains("t6"), "names the operand: {}", e.message);
+        assert!(
+            e.message.contains("Col") && e.message.contains("[4, 1]"),
+            "states the mode AND the extent it requires: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ AND THE FLAGS ARE POSITIONAL, so a length that does not match the inputs is refused rather
+    /// than zip-truncated onto some other operand.
+    #[test]
+    fn a_flag_slice_of_the_wrong_length_is_refused() {
+        let r = node(
+            reg(5, 4, 128, false),
+            reg(6, 4, 1, false),
+            reg(7, 4, 128, true),
+        );
+        let mut sym = 0i64;
+        let Err(e) = elementwise(
+            "sub_s3",
+            Elementwise::Sub,
+            &r,
+            &[Some(BcastAxis::Col)],
+            &mut sym,
+            None,
+        ) else {
+            panic!("one flag for two inputs must refuse — zip would silently flag input 0 instead")
+        };
+        assert!(
+            e.message.contains("POSITIONAL"),
+            "says why the length matters: {}",
+            e.message
+        );
+    }
+
+    /// ⛔ A UNARY WHOSE ONLY INPUT IS THE BROADCAST is a materialization, not a pointwise op.
+    #[test]
+    fn a_unary_broadcast_input_is_refused_by_name() {
+        let r = vec![reg(5, 4, 1, false), reg(7, 4, 128, true)];
+        let mut sym = 0i64;
+        let Err(e) = elementwise(
+            "silu_s3",
+            Elementwise::Silu,
+            &r,
+            &[Some(BcastAxis::Col)],
+            &mut sym,
+            None,
+        ) else {
+            panic!("f(vector) -> tile is a spray, not a pointwise op")
+        };
+        assert!(
+            e.message.contains("SPRAY") || e.message.contains("spray"),
+            "names what it would be: {}",
+            e.message
+        );
     }
 
     // ── (iii) EXHAUSTIVE DECLARED-SET ASSERTIONS ──────────────────────────────────────────────
@@ -4335,8 +4497,10 @@ pub fn rmsnorm_at(
 /// ([`super::whole_function::splat_scale_of`]), which is where the op is; this body's job is the
 /// descriptor.
 ///
-/// Everything below is unchanged and shared, so the two doors cannot drift about what a scalarmul
-/// EMITS — only about where its number came from.
+/// ⭐ AND THIS IS THE ONLY BODY. [`scalarmul`] DELEGATES here, so the two doors cannot drift about
+/// what a scalarmul emits — only about where its number came from. It used to be a COPY with that
+/// same sentence on it, and the copy drifted in the one arm nothing could reach; see the operand-order
+/// note below for what that cost.
 pub fn scalarmul_at(
     name: &str,
     scale: f32,
@@ -4448,9 +4612,36 @@ pub fn scalarmul_at(
                 g.index_tid, idx_r.v_rows, idx_r.v_cols,
             ));
         }
-        // ⭐ THE STRUCT FORM, which is how this door takes its arguments as of the merged gather
-        // (#92): eleven positional parameters became one named record, and the index's position is
-        // `gathered_input` rather than a bare index.
+        // ⛔⛔⛔ THE TABLE GOES **LAST**, AND THE SWAP IS THE ONE THING THIS BRANCH DOES TO ITS OPERANDS.
+        //
+        // Two placement laws have to hold at once and they coincide at exactly one position. The index
+        // is inserted immediately BEFORE THE OUTPUT (`attach_gather_index`, which is the vendor's
+        // `[input, index, output]` order and what keeps the output last however many operands are
+        // added); dbo separately needs the index to sit NEXT TO the tensor it indexes, or the gathered
+        // operand's use precedes the idx→address program's definition and
+        // `DSC2ToDataflowIR.cpp:51` reports `operand #1 does not dominate this use`. Both hold only
+        // when the gathered tensor is the LAST input.
+        //
+        // The ungathered order above is `[table, scalar]`, which would emit `[table, scalar, idx, out]`
+        // — index at 2, table at 0, non-adjacent. Swapping to `[scalar, table]` emits
+        // `[scalar, table, idx, out]`: adjacent AND output-last.
+        //
+        // ⭐ AND IT IS FREE HERE BECAUSE THE OP IS `multiply`, which is commutative — the SAME two
+        // operands and the same `opFuncName`, in the other order. This is not a general licence: a
+        // non-commutative pointwise gathering a non-last operand has no such swap, which is why
+        // `assemble_pointwise_broadcast_gather` REFUSES that rather than reordering on the caller's
+        // behalf.
+        //
+        // ⛔⛔⛔ AND THIS ARM HELD `inputs` / `gathered_input: 0` UNTIL THE WHOLE-FUNCTION DOOR REACHED
+        // IT. `scalarmul_at`'s header said "everything below is unchanged and shared, so the two doors
+        // cannot drift about what a scalarmul EMITS" — but the body was COPIED, not shared, and the
+        // swap above was added to ONE copy. The other was unreachable (`region_for_operand` refused an
+        // indirect access tile before any op was built), so nothing ran it, and the first program that
+        // did got `assemble_pointwise_broadcast_gather`'s own refusal: "input 0 of 2 is named as the
+        // gathered operand ... those are the same slot only for the LAST input". MEASURED, the moment
+        // that refusal was lifted: `KTIR_WHOLE=1 bake_py embedding_granite`. `scalarmul` now DELEGATES
+        // here, so there is one body and the drift class is gone rather than repaired.
+        let gathered_inputs = [In::scalar(&scale_h).ew(), In::full(&x_h).ew()];
         return crate::emit::assemble_pointwise_broadcast_gather(
             crate::emit::PointwiseGather {
                 op_name: &op_name,
@@ -4458,15 +4649,18 @@ pub fn scalarmul_at(
                 op_func: "multiply",
                 rows,
                 cols,
-                inputs: &inputs,
-                gathered_input: 0,
+                inputs: &gathered_inputs,
+                gathered_input: 1,
                 index_name: &crate::place::act_name(g.index_tid),
                 o: &rbo(&out_name),
             },
             sym_id_base,
             layout,
         )
-        .map(|op| vec![op])
+        // ⭐ MANY OPS, ONE PER INDEX STICK. The index reaches the IBR as ONE stick transfer, so a node
+        // with more entries than that is a leg per stick — each writing its own row window of the
+        // output in place. `assemble_pointwise_broadcast_gather` owns that cut, and the node's own
+        // 32-entry ceiling with it, so nothing here counts entries.
         .map_err(Error::from);
     }
     Ok(vec![assemble_pointwise_broadcast_off_from_tile(

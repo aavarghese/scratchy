@@ -137,6 +137,9 @@ pub enum PoolBuildError {
     /// needs at least one bucket; degenerate models that emit none
     /// would fail at `pick_bucket` time anyway, so we fail early.
     NoBuckets,
+    /// The device's IO-registry entry has no GPU core count
+    /// ([`crate::device::gpu_cores`]), which the TurboQuant decode tapes need.
+    UnknownGpuCores,
 }
 
 impl std::fmt::Display for PoolBuildError {
@@ -152,6 +155,10 @@ impl std::fmt::Display for PoolBuildError {
             ),
             Self::Worker(e) => write!(f, "MetalWorkerPool::for_buckets: {e}"),
             Self::NoBuckets => write!(f, "MetalWorkerPool::for_buckets: bucket_specs is empty"),
+            Self::UnknownGpuCores => write!(
+                f,
+                "MetalWorkerPool::for_buckets: the device's IO-registry entry has no gpu-core-count"
+            ),
         }
     }
 }
@@ -499,6 +506,20 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         // scratch sizing are u32). Floor at 1 so a degenerate cap
         // (e.g. the empty-for-vision pool) never zero-sizes scratch.
         let block_cap_u32: u32 = block_cap.clamp(1, u32::MAX as usize) as u32;
+        use crate::tape::ids::{HeadDim, NumKvHeads, NumQHeads, TqDecodeHeads};
+        let gpu_cores = crate::device::gpu_cores(&device).ok_or(PoolBuildError::UnknownGpuCores)?;
+        let tq_heads = TqDecodeHeads::for_group(
+            HeadDim(W::GLOBAL_HEAD_DIM),
+            NumQHeads(W::NUM_Q_HEADS),
+            NumKvHeads(W::NUM_GLOBAL_KV_HEADS),
+            gpu_cores,
+        );
+        tracing::info!(
+            target: "scratchy-target-metal",
+            gpu_cores = gpu_cores.get(),
+            tq_decode_heads = tq_heads.get(),
+            "query heads per TurboQuant decode threadgroup"
+        );
         let mut tapes: Vec<LoweredMetalTape> = Vec::with_capacity(bucket_specs.len());
         for spec in bucket_specs {
             let variant = spec
@@ -511,7 +532,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
                         "no baked tape variant for gen_class={gen_class:?} chunked={chunked}"
                     ),
                 })?;
-            tapes.push(variant.materialize(block_cap_u32));
+            tapes.push(variant.materialize(block_cap_u32, tq_heads));
         }
         let bucket_tapes: Arc<[LoweredMetalTape]> = Arc::from(tapes);
 
@@ -1080,11 +1101,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         }
 
         let guard = self.checkout(weights)?;
-        write_runtime_inputs(&guard.runtime, inputs)?;
-        guard.worker.tq_dequant_max_blocks.store(
-            tq_dequant_block_width(inputs),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        begin_step(&guard, inputs)?;
 
         let t_pre = std::time::Instant::now();
         let cb = self
@@ -1265,11 +1282,7 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
         }
 
         let guard = self.checkout(weights)?;
-        write_runtime_inputs(&guard.runtime, inputs)?;
-        guard.worker.tq_dequant_max_blocks.store(
-            tq_dequant_block_width(inputs),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        begin_step(&guard, inputs)?;
 
         // All execution goes through the MTL4 path. (The opt-in MTL3
         // dispatch path was removed — it only ever ran the all-dispatch
@@ -1368,12 +1381,52 @@ impl<W: CanonicalParams> MetalWorkerPool<W> {
 /// STRIDE for this forward. The serving worker flattens the block table to
 /// `[num_reqs * max_blocks_eff]` (gpu_worker.rs), with
 /// `max_blocks_eff = max(W::MAX_BLOCKS_PER_SEQ, runtime_max_blocks)`, so the
-/// stride recovers as `len / num_seqs`. The `TqDequantToScratch` dispatch must
+/// stride recovers as `len / num_seqs`. The `TqStageRotated` dispatch must
 /// cover exactly this many blocks so the reused fp16 scratch is filled for the
 /// WHOLE active context (the kernel early-exits past `seqused_k`); the static
 /// `W::MAX_BLOCKS_PER_SEQ` truncated it at 2048 tokens for uniform arches.
 /// Returns 0 when there is no block table (decode-via-cache buckets etc.) — the
 /// dispatch then falls back to the baked const.
+/// Upload the step's inputs into the worker's runtime buffers and set the
+/// per-step values its dispatch reads.
+fn begin_step<W: CanonicalParams>(
+    worker: &PooledWorker<W>,
+    inputs: &ForwardInputs<'_>,
+) -> Result<(), ForwardError> {
+    use std::sync::atomic::Ordering::Relaxed;
+    write_runtime_inputs(&worker.runtime, inputs)?;
+    worker
+        .worker
+        .tq_dequant_max_blocks
+        .store(tq_dequant_block_width(inputs), Relaxed);
+    worker.worker.unrotated_blocks.store(
+        step_has_unrotated_blocks(inputs, W::GLOBAL_BLOCK_SIZE),
+        Relaxed,
+    );
+    Ok(())
+}
+
+/// Whether some sequence of the step has an unrotated (bit-31, span) block
+/// among the blocks it uses, in the full KV group's block table.
+fn step_has_unrotated_blocks(inputs: &ForwardInputs<'_>, block_size: u32) -> bool {
+    let (Some(table), stride) = (inputs.block_tables.first(), tq_dequant_block_width(inputs))
+    else {
+        return false;
+    };
+    let stride = stride as usize;
+    if stride == 0 {
+        return false;
+    }
+    table.chunks(stride).enumerate().any(|(seq, row)| {
+        let used = inputs.seq_used_k.map_or(stride, |k| {
+            (k.get(seq).copied().unwrap_or(0) as usize).div_ceil(block_size.max(1) as usize)
+        });
+        row[..used.min(row.len())]
+            .iter()
+            .any(|b| b & crate::UNROTATED_BLOCK_BIT != 0)
+    })
+}
+
 fn tq_dequant_block_width(inputs: &ForwardInputs<'_>) -> u32 {
     let num_seqs = inputs
         .cu_seqlens_q
@@ -2144,6 +2197,49 @@ mod tests {
             "8 fits index 2 (bucket_m=8)"
         );
         assert_eq!(pool.pick_bucket(9).unwrap(), 0, "9 only fits the 32 bucket");
+    }
+
+    /// A step has an unrotated block only if some sequence's USED blocks hold
+    /// one: a bit-31 entry past a sequence's `seq_used_k` (stale padding in
+    /// its row) does not count, and neither does another group's table.
+    #[test]
+    fn a_step_has_unrotated_blocks_only_among_the_blocks_it_uses() {
+        let flagged = |b: u32| b | crate::UNROTATED_BLOCK_BIT;
+        let cu = [0u32, 1, 2];
+        let used = [32u32, 17];
+        let has = |table: &[u32]| {
+            let inputs = ForwardInputs {
+                span_ids: None,
+                num_tokens: 2,
+                input_ids: &[0, 0],
+                positions: &[31, 16],
+                slot_mappings: Vec::new(),
+                cu_seqlens_q: Some(&cu),
+                seq_used_k: Some(&used),
+                block_tables: vec![table],
+                has_spec_tokens: false,
+                last_token_indices: None,
+                gdn_state_indices: None,
+                gdn_is_fresh: None,
+                vision_rope_freqs: None,
+                vision_cu_seqlens_full: None,
+                vision_cu_seqlens_window: None,
+                vision_window_index: None,
+                vision_reverse_indices: None,
+                vision_position_ids: None,
+                pixels: None,
+                pos_embeds: None,
+                mm_embeds: None,
+                mm_dst_rows: None,
+                mrope_cos_sin: None,
+            };
+            step_has_unrotated_blocks(&inputs, 16)
+        };
+        // Rows of 4 blocks; the first sequence uses 2 blocks, the second 2.
+        assert!(!has(&[1, 2, 0, 0, 3, 4, 0, 0]));
+        assert!(has(&[1, flagged(2), 0, 0, 3, 4, 0, 0]));
+        assert!(has(&[1, 2, 0, 0, 3, flagged(4), 0, 0]));
+        assert!(!has(&[1, 2, flagged(9), 0, 3, 4, 0, flagged(9)]));
     }
 
     #[test]

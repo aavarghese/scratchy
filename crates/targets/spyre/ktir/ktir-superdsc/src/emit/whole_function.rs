@@ -43,11 +43,15 @@
 //! guessed node kind is a well-formed descriptor computing the wrong function.
 
 use ktir_core::attrkey::AttrKey;
-use ktir_core::ir::{Attr, IRFunction, Ssa};
+use ktir_core::ir::{Attr, IRFunction, Operation, Ssa};
 use ktir_core::opkind::OpKind;
 
-use super::lower_ktir_to_superdsc::{Error, Region, err, regions};
+use super::lower_ktir_to_superdsc::{Error, Gather, Region, err, gather_of, regions};
 use crate::ktir_node::{Elementwise, KtirNode, Program, ReduceKind};
+// The broadcast AXIS is the emission door's own vocabulary — `elementwise` selects the `In` builder
+// from it — so it lives beside that door and this recogniser names the same type rather than a
+// parallel one that would have to be mapped across the boundary.
+use super::lower_ktir_to_superdsc::BcastAxis;
 use crate::placement::BundleLayout;
 
 /// THE SILU LONGHAND, as the ONE fused op it is — `out = silu(gate) · up`.
@@ -955,22 +959,6 @@ fn is_plumbing(op: OpKind) -> bool {
     )
 }
 
-/// WHICH AXIS a recognised rank-plumbing chain broadcasts along.
-///
-/// The two are not interchangeable and the device says which through a different `In` builder, so
-/// they are a variant rather than a `bool`: [`In::col`] marks the operand out-broadcast (a per-row
-/// scalar sprayed along the stick axis) and [`In::mb`] marks it mb-broadcast (a row vector sprayed
-/// down the rows). Emitting one for the other reads a `[m, 1]` operand as a `[1, n]` and takes the
-/// wrong bytes for every row after the first.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BcastAxis {
-    /// `[m, 1]` → `[m, n]`: a per-row scalar (a row reduction's result) sprayed along the columns.
-    /// The softmax's `m[:, None]` and `l[:, None]`.
-    Col,
-    /// `[1, n]` → `[m, n]`: a row vector (an rmsnorm gain) sprayed down the rows. `n1[None, :]`.
-    Mb,
-}
-
 /// ONE recognised broadcast: the value a consumer reads, resolved back to the rank-2 SOURCE the
 /// chain started from, plus the axis.
 #[derive(Clone, Copy)]
@@ -1159,15 +1147,32 @@ fn program_broadcast_chains(
 /// previous op's result). Those are the caller's two other cases: a constant operand, and an
 /// intermediate.
 ///
-/// ⛔ AN INDIRECT ACCESS TILE IS REFUSED BY NAME HERE RATHER THAN REPORTED AS `None`, and that is
-/// a correctness fix to a DIAGNOSTIC. `Ok(None)` means "not a load of a parameter", and the caller
-/// turns it into "then it is a constant (a `tensor.splat`)" — a sound deduction only while the two
-/// tile kinds are the one this walk matches. A `ktdp.construct_indirect_access_tile` IS a load of a
-/// parameter, so falling through named the wrong cause for every gathered operand: a Triton
-/// embedding's `arith.mulf` reads a gathered `[64, 4096]` row tile and was reported as reading a
-/// splat, sending a reader to look for a constant that is not there. MEASURED on
-/// `test/fixtures/embedding.py`, whose `%34 = arith.mulf(%30, %33)` has the gathered load at
-/// input 0 and the splat at input 1 — and the refusal named input 0.
+/// ⭐⭐⭐ AN INDIRECT ACCESS TILE RESOLVES TO THE **GATHERED PARAMETER'S** REGION, and it must never
+/// be reported as `None`. `Ok(None)` means "not a load of a parameter", and the caller turns it into
+/// "then it is a constant (a `tensor.splat`)" — a sound deduction only while the two tile kinds are
+/// the one this walk matches. A `ktdp.construct_indirect_access_tile` IS a load of a parameter, so
+/// falling through named the wrong cause for every gathered operand: a Triton embedding's
+/// `arith.mulf` reads a gathered `[64, 4096]` row tile and was reported as reading a splat, sending a
+/// reader to look for a constant that is not there. MEASURED on `test/fixtures/embedding.py`, whose
+/// `%34 = arith.mulf(%30, %33)` has the gathered load at input 0 and the splat at input 1.
+///
+/// ⛔ IT WAS A REFUSAL, on the grounds that "no `Program` in this crate carries an index operand" —
+/// and that had stopped being true of this crate. [`Program::ScalarMul`] carries one:
+/// [`super::lower_ktir_to_superdsc::scalarmul_at`] takes a [`Gather`] and routes to
+/// [`crate::emit::assemble_pointwise_broadcast_gather`], which emits the cross-linked `allocate`
+/// pair and the `computeOp_.indirectAccessIndexLabeledDs` the refusal said nothing emitted. MEASURED:
+/// `bake_py embedding_granite` through the per-`Program` door bakes one descriptor carrying all four
+/// gather fields, and `dxp_standalone --bundle` exits 0 on it. So the door was shut on a fact about
+/// the crate, and the whole-function walk was the last reader still asserting it.
+///
+/// ⛔⛔ THE GATHERED TILE'S OWN WINDOW IS **NOT** WHAT IS RETURNED, and that is deliberate. An
+/// indirect tile's `Shape` is the gathered tile (`[BLOCK_M, D_MODEL]`) and its ROWS are chosen by
+/// data, so there is no window over the table for a `Region` to carry — the table is addressed at its
+/// base and the index supplies every row. [`super::lower_ktir_to_superdsc::scalarmul_at`] reads this
+/// region for its `tid` (the operand name, and the key into the layout) and takes the descriptor's
+/// row count off the OUTPUT, which is the only place it can honestly come from. So the parameter's
+/// own region is exact here, and the one thing that would be wrong on it — a row corner — is what
+/// `base_addressed` refuses downstream.
 pub fn region_for_operand(k: &KtirNode, v: Ssa) -> Result<Option<Region>, Error> {
     // The parameter-rooted walk already computes every field of a `Region` correctly; the only
     // thing wrong for a multi-op function is WHICH parameter and WHICH tile. So find the parameter
@@ -1180,29 +1185,39 @@ pub fn region_for_operand(k: &KtirNode, v: Ssa) -> Result<Option<Region>, Error>
         .find(|o| o.result == Some(v) && o.op_type == OpKind::KtdpLoad);
     let Some(load) = load else { return Ok(None) };
     let tile_v = load.operands.first().copied();
-    if f.operations
+    // A GATHERED LOAD. Operand 0 of the indirect tile is the DATA view and operand 1 the INDEX view —
+    // [`gather_of`]'s own reading of the same op, so the two walks cannot disagree about which
+    // parameter is gathered.
+    if let Some(ind) = f
+        .operations
         .iter()
-        .any(|o| o.result == tile_v && o.op_type == OpKind::KtdpConstructIndirectAccessTile)
+        .find(|o| o.result == tile_v && o.op_type == OpKind::KtdpConstructIndirectAccessTile)
     {
-        return err(format!(
-            "{}: this operand is loaded through a `ktdp.construct_indirect_access_tile` — a \
-             GATHER, whose row index is data rather than an affine function of the tile id. It IS \
-             a load of a parameter, so it is named here rather than falling through to the \
-             caller's \"then it is a constant\" arm. No `Program` in this crate carries an index \
-             operand, and the descriptor a gather needs is a pair of `allocate` nodes \
-             (`indirectAllocType_` `index_tensor`/`value_tensor` cross-linked by \
-             `relatedIndirectAccessAlloc_`) plus `computeOp_.indirectAccessIndexLabeledDs` — none \
-             of which this lowering emits. Lower an indirect access tile elsewhere, or add that \
-             assembler.",
-            f.name
-        ));
+        return region_of_view_operand(k, ind, 0);
     }
     let tile = f
         .operations
         .iter()
         .find(|o| o.result == tile_v && o.op_type == OpKind::KtdpConstructAccessTile);
     let Some(tile) = tile else { return Ok(None) };
-    let view_v = tile.operands.first().copied();
+    region_of_view_operand(k, tile, 0)
+}
+
+/// The [`Region`] of the parameter that operand `slot` of a TILE op reinterprets — the tail both the
+/// plain and the indirect arm of [`region_for_operand`] share, and the walk the index operand needs a
+/// door of its own for.
+///
+/// ⭐ ONE FUNCTION BECAUSE THE THREE CALLERS MUST AGREE. `regions()` is a positional zip of the
+/// function's arguments against the node's bindings, so "which parameter" decides which row of it is
+/// read; three separate `position(|(a, _)| Some(*a) == ptr)` walks is three chances to reach a
+/// different row from the same IR.
+fn region_of_view_operand(
+    k: &KtirNode,
+    tile: &Operation<'_>,
+    slot: usize,
+) -> Result<Option<Region>, Error> {
+    let f = &k.func;
+    let view_v = tile.operands.get(slot).copied();
     let view = f
         .operations
         .iter()
@@ -1281,6 +1296,17 @@ pub fn lower_function(
     // THE BROADCAST PLUMBING, read before the walk for the same reason: these ops lower to NOTHING and
     // the consumer carries the broadcast as an operand mode. See [`program_broadcast_chains`].
     let (bcasts, bcast_consumed) = program_broadcast_chains(f)?;
+    // ⭐⭐⭐ THE GATHER THE PROGRAM STATES, read ONCE and from [`gather_of`] — the SAME reading the
+    // per-`Program` door takes, so the two doors cannot disagree about whether a node gathers, which
+    // parameter is the table or which is the index. It already refuses a program with two indirect
+    // tiles by name, so there is at most one, and the walk below names the op that carries it.
+    //
+    // ⛔ AND IT IS CARRIED, NOT COUNTED: `gather_carried` below is checked after the walk. A gather
+    // the program states and no descriptor declares is a silently DIRECT read of the table's first
+    // rows — well formed, the right shape and dtype, and nothing else in the pipeline compares an
+    // emitted descriptor against the program's indirect tile.
+    let gather = gather_of(k)?;
+    let mut gather_carried = false;
 
     for op in f.operations.iter() {
         if is_plumbing(op.op_type) {
@@ -1472,6 +1498,69 @@ pub fn lower_function(
             }
         }
 
+        // ⭐⭐⭐ THIS OP'S GATHER, IF THE ONE THE PROGRAM STATES IS THE ONE IT READS.
+        //
+        // The join is by TID against the resolved input regions — not "the function gathers, so every
+        // op gathers". A decoder whose embedding gathers and whose matmuls do not would otherwise hand
+        // every descriptor an index operand for a table it does not read, which is exactly what
+        // `scalarmul_at`'s own `g.value_tid != ins[0].tid` refuses; joining here means the refusal is
+        // never reached by a program this walk could have described correctly.
+        //
+        // ⛔ AND THE INDEX PARAMETER IS APPENDED TO `per_op`, because the walk has no other way to
+        // reach it. The index is ADDRESSING, so it is not an operand of the `arith.mulf` at all — the
+        // gathered load consumed it inside the indirect tile. Without its region `scalarmul_at` cannot
+        // check the one thing that matters most ("the index buffer really holds `rows` indices", whose
+        // failure mode is converting past the buffer's end), and `split_out_excluding` is the
+        // mechanism that keeps the arity at 1 while the region is present: it drops the index BY TID.
+        //
+        // ⛔ APPENDED AFTER the inputs and BEFORE the output, which both orders below rely on.
+        // `bcast_axes` is indexed by input position, so the index may not sit among them; `ins[0]` is
+        // the gathered table, so it may not come first.
+        let op_gather = match gather {
+            Some(g) if per_op.iter().any(|r| r.tid == g.value_tid) => {
+                let idx_r = f
+                    .arguments
+                    .iter()
+                    .zip(k.bindings.iter())
+                    .position(|(_, b)| b.get() == g.index_tid)
+                    .and_then(|i| regions(k).ok().and_then(|all| all.get(i).copied()));
+                let Some(mut idx_r) = idx_r else {
+                    return err(format!(
+                        "{}: the program gathers through t{}, which is not one of this function's \
+                         bound parameters — an index buffer with no binding has no placement and no \
+                         stated length, and the descriptor makes dbo's idx→address program iterate \
+                         one entry per row of the node",
+                        f.name, g.index_tid
+                    ));
+                };
+                idx_r.is_out = false;
+                per_op.push(idx_r);
+                gather_carried = true;
+                Some(g)
+            }
+            _ => None,
+        };
+        // ⛔⛔⛔ A GATHERED OPERAND MAY ONLY REACH A BODY THAT DECLARES THE INDEX. `ScalarMul` is the
+        // one — `scalarmul_at` takes the [`Gather`] and routes to
+        // `assemble_pointwise_broadcast_gather`. Every other arm of [`emit_one`] would emit an
+        // ordinary descriptor over the table, i.e. read its first `rows` rows DIRECTLY and ignore the
+        // ids: right shape, right dtype, right distribution, wrong rows, and nothing downstream
+        // compares the two. So it is refused by name rather than lowered as the nearest thing.
+        if op_gather.is_some() && !matches!(program, Lowering::ScalarMul(_)) {
+            return err(format!(
+                "{}: `{:?}` reads a `ktdp.construct_indirect_access_tile` (t{} gathered through \
+                 t{}), and this door declares an index operand only for `Program::ScalarMul` — \
+                 `scalarmul_at` is the one body that carries a `Gather`. Every other assembler here \
+                 would emit a descriptor reading the table DIRECTLY at its base, which is the right \
+                 shape and the wrong rows, from a clean bake. Give the gathered operand its own \
+                 `ScalarMul` node, or add the index to the assembler this op needs.",
+                f.name,
+                op.op_type,
+                gather.map_or(0, |g| g.value_tid),
+                gather.map_or(0, |g| g.index_tid),
+            ));
+        }
+
         // ⭐⭐⭐⭐⭐ A PLAIN-B CONTRACTION IS CONTRACTED WHERE IT LIES — NO RELAYOUT, NO ARCH FEATURE,
         // AND NOTHING TO EMIT HERE AT ALL.
         //
@@ -1608,8 +1697,18 @@ pub fn lower_function(
             inter.insert(res, r);
             per_op.push(r);
             let name = f.name;
-            let mut emitted =
-                emit_one(name, program, &per_op, sym_id_base, Some(layout), b_orient)?;
+            let mut emitted = emit_one(
+                name,
+                program,
+                &per_op,
+                sym_id_base,
+                Some(layout),
+                WalkProof {
+                    b_orient,
+                    gather: op_gather,
+                    bcast: &bcast_axes,
+                },
+            )?;
             out.append(&mut emitted);
             lowered += 1;
             continue;
@@ -1637,7 +1736,18 @@ pub fn lower_function(
         o.is_out = true;
         per_op.push(o);
 
-        let mut emitted = emit_one(f.name, program, &per_op, sym_id_base, layout, b_orient)?;
+        let mut emitted = emit_one(
+            f.name,
+            program,
+            &per_op,
+            sym_id_base,
+            layout,
+            WalkProof {
+                b_orient,
+                gather: op_gather,
+                bcast: &bcast_axes,
+            },
+        )?;
         out.append(&mut emitted);
         lowered += 1;
     }
@@ -1645,7 +1755,51 @@ pub fn lower_function(
     if lowered == 0 {
         return err(format!("{}: no compute op in the function", f.name));
     }
+    // ⛔⛔⛔ A GATHER THE PROGRAM STATES AND NO DESCRIPTOR CARRIES IS A SILENTLY DIRECT READ.
+    //
+    // `gather_of` proved the program has an indirect access tile; if the join above matched no op's
+    // input region, every emitted descriptor reads the table at its base and the ids are never
+    // consulted — the right shape, the right dtype, and rows the program never named. Nothing further
+    // down compares an emitted descriptor against the program's indirect tile, and the fixture's own
+    // table rows are independent `randn` draws, so the wrong rows are statistically indistinguishable
+    // from the right ones (`triton-numeric/tests/embedding_gather.rs` opens with exactly this).
+    //
+    // ⭐ IT CANNOT BE FOLDED INTO THE JOIN. The join is per-op and cannot know whether a LATER op
+    // reads the table, so "no op matched" is only knowable once the walk is done.
+    if let Some(g) = gather
+        && !gather_carried
+    {
+        return err(format!(
+            "{}: the program states a `ktdp.construct_indirect_access_tile` over t{} indexed by \
+             t{}, and no op this walk lowered reads t{} — so every descriptor emitted would read the \
+             table at its BASE and the index buffer would never be consulted. That is the right \
+             shape and the wrong rows, from a clean bake, and nothing downstream compares the two. \
+             The gathered value must be an input of an op this door lowers.",
+            f.name, g.value_tid, g.index_tid, g.value_tid,
+        ));
+    }
     Ok(out)
+}
+
+/// WHAT ONLY THE WALK CAN STATE about one op. Threaded rather than re-derived, because [`emit_one`]
+/// holds the REGIONS and not the ops — re-deriving any of these there would mean re-walking the
+/// chain without them. They ride together as one value because they are one op's row in the walk.
+///
+/// ⛔ DESTRUCTURED WITHOUT `..` at the head of [`emit_one`], so a fourth proof added here and not
+/// carried through is an E0027 at that line rather than a field nobody reads.
+struct WalkProof<'a> {
+    /// The B orientation the WALK proved from this op's own `indexing_maps` — `Some` for exactly a
+    /// `Node(Program::Matmul)`, which is the only arm that reads it.
+    b_orient: Option<BOrient>,
+    /// The gather THIS op reads, when the one the program states is over one of its inputs — the
+    /// walk's own join. `None` for every op of every program that states no
+    /// `ktdp.construct_indirect_access_tile`, which is every fixture but the embedding, and then the
+    /// arms below are byte-identical to what they were.
+    gather: Option<Gather>,
+    /// The per-input broadcast axes the WALK proved from this op's own rank-plumbing chain (see
+    /// [`program_broadcast_chains`]) — positional with `per_op`'s inputs, empty when no operand is
+    /// broadcast.
+    bcast: &'a [Option<BcastAxis>],
 }
 
 /// Hand ONE op's regions to the body its `Program` names.
@@ -1659,11 +1813,13 @@ fn emit_one(
     per_op: &[Region],
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-    // The B orientation the WALK proved from this op's own `indexing_maps` — `Some` for exactly a
-    // `Node(Program::Matmul)`, which is the only arm that reads it. Threaded rather than re-derived
-    // because this fn has the regions, not the op.
-    b_orient: Option<BOrient>,
+    proof: WalkProof<'_>,
 ) -> Result<Vec<super::EmittedOp>, Error> {
+    let WalkProof {
+        b_orient,
+        gather,
+        bcast,
+    } = proof;
     // THE FUSED SILU. Reached only through [`program_silu_mul_chains`], which PROVED the five-op
     // longhand; `per_op` is `[gate, up, out]`, which is the parameter order `silumul`'s own
     // `split_out(.., 2)` reads.
@@ -1680,15 +1836,16 @@ fn emit_one(
         // the per-`Program` door reaches through `scalarmul`, so the two cannot drift about what a
         // scalar multiply emits.
         Lowering::ScalarMul(scale) => {
-            // `None`: this door reaches a scalarmul through `region_for_operand`, which REFUSES an
-            // indirect access tile by name before any op is built (see its own doc) — so a gathering
-            // node never gets here, and passing the program's gather would be claiming a path that is
-            // still closed. The per-`Program` door (`lower_ktir_to_superdsc::scalarmul`) is the one
-            // that reads `gather_of` and carries it.
+            // ⭐ THE PROGRAM'S OWN GATHER, THREADED. It was `None` with a note saying this door
+            // "REFUSES an indirect access tile by name before any op is built" — true of
+            // `region_for_operand` as it then was, and the reason the whole-function door could not
+            // bake a Triton embedding while the per-`Program` door could. Both doors now reach the
+            // SAME body with the SAME `gather_of` reading, so they cannot drift about what a gathered
+            // scalar multiply emits.
             return super::lower_ktir_to_superdsc::scalarmul_at(
                 name,
                 scale,
-                None,
+                gather,
                 per_op,
                 sym_id_base,
                 layout,
@@ -1735,7 +1892,7 @@ fn emit_one(
             )?
         }
         Program::Elementwise(e) => {
-            super::lower_ktir_to_superdsc::elementwise(name, e, per_op, sym_id_base, layout)?
+            super::lower_ktir_to_superdsc::elementwise(name, e, per_op, bcast, sym_id_base, layout)?
         }
         Program::Transpose => {
             super::lower_ktir_to_superdsc::transpose(name, per_op, sym_id_base, layout)?

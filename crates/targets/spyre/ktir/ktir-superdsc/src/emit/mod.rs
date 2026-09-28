@@ -30,7 +30,7 @@ use crate::superdsc_error::SuperDscError;
 use crate::superdsc_opspec::{
     Allocation, AnyTensorArg, ArgView, DataFormat, DeviceTileLayout, Df, Fp8, Fp16, Fp32,
     IndirectRole, ItDim, MAX_CORES, MaxCores, OpFunc, OpInfo, OpSpec, Role, Scale, SdscFoldSet,
-    StickExtent, TensorArg, WorkPlan, assert_df_stick_multiple,
+    StickExtent, TensorArg, USABLE_LX_BYTES, WorkPlan, assert_df_stick_multiple,
 };
 use crate::wire::{
     AddrFold, AllocNode, ComputeAttrs, ComputeOp, Dsc, FoldFunc, FoldProp, IterSpace, LabeledDs,
@@ -751,11 +751,19 @@ pub struct PointwiseGather<'a, O: KindTag> {
 /// They panic because they run inside scratchy's `#[forward]` proc-macro, where a panic IS the build
 /// error. This door is reached from a third-party KTIR producer's driver, and every refusal below is a
 /// statement about the PROGRAM rather than about this crate — so it returns them.
+///
+/// ## ⭐⭐⭐ AND IT RETURNS **MANY** OPS, BECAUSE ONE GATHER OP'S INDEX IS ONE STICK
+/// The index reaches the L3LU IBR as a single `SenUint32` stick transfer
+/// ([`crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP`] entries), so a node with more entries than that
+/// is emitted as one op per stick, each writing its own ROW WINDOW of the output in place — no scratch
+/// and no relayout. The body carries the three card measurements that fixed that shape: what the
+/// un-cut op did (`ids[r mod 32]`), what a row-major destination does (a PCIe bus fence), and which
+/// wire field the window's stick-plane stride actually comes from (`N_`, not `maxDimSizes_`).
 pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
     g: PointwiseGather<'_, O>,
     sym_id_base: &mut i64,
     layout: Option<&BundleLayout>,
-) -> Result<EmittedOp, SuperDscError> {
+) -> Result<Vec<EmittedOp>, SuperDscError> {
     let PointwiseGather {
         op_name,
         tile_op,
@@ -792,20 +800,276 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
             inputs.len()
         )));
     }
+    // ⭐ THE ENTRY COUNT, DERIVED BEFORE ANY OP IS BUILT — because it decides how many ops there are.
+    // The page is [`PageExtent::single_position`] for a table lookup (one entry IS one row, see the
+    // header); it is named ONCE here and handed to every leg, so the number this function counts
+    // entries with and the number `attach_gather_index` declares cannot differ.
+    let page = crate::superdsc_opspec::PageExtent::single_position();
+    let entries = page.entries_in(rows).ok_or_else(|| {
+        SuperDscError(format!(
+            "{op_name}: the gather pages `mb` by {} position(s) and this op's extent along it is \
+             {rows}, which does not divide into whole entries — a partial entry is an address.",
+            page.get(),
+        ))
+    })?;
+    let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
     // The OUTPUT kind drives the layout, exactly as in the sibling assemblers: a `Stk<FlatTag>` output
     // is a head-major rank-3 op, a `Stk<RowBlockedTag>` output is the rank-2 stick-major token stream.
     let head_major = O::kind() == StickKind::Flat;
-    let mut op = pointwise_broadcast_opspec_from_tile(
+    // ⭐ ONE INDEX STICK ⇒ ONE OP OVER THE WHOLE NODE. Byte-for-byte what this door emitted before the
+    // cut existed, which is what keeps `embedding_granite_m32`'s card-proven descriptor unmoved.
+    if entries <= cap {
+        return Ok(vec![one_gathered_leg(
+            GatherLeg {
+                op_name,
+                leg_name: op_name,
+                tile_op,
+                op_func,
+                leg_rows: rows,
+                node_rows: rows,
+                first_row: 0,
+                cols,
+                inputs,
+                gathered_input,
+                index_name,
+                page,
+                first_entry: crate::superdsc_opspec::EntryBase::ZERO,
+                o_name: o.name(),
+                head_major,
+            },
+            sym_id_base,
+            layout,
+        )?]);
+    }
+    // ⛔⛔⛔⛔⛔ ONE GATHER OP'S INDEX IS ONE STICK, AND THIS DOOR WAS THE ONE GATHER IN THE CRATE
+    // WITHOUT THAT GUARD. `gather_copy_opspec` refuses a longer run BY NAME with the card measurement
+    // behind it ("dxp loads the IBR in a single stick transfer and takes each core's read offset inside
+    // it modulo that stick, so entries past the first 32 WRAP and those cores gather another core's
+    // pages with a clean bake" — rung 8's corruption). Everything in that sentence is a property of the
+    // INDEX OPERAND, not of that builder's destination, so it was never `gather_copy_opspec`'s alone to
+    // enforce: this door declares the same `Role::Index` through the same `attach_gather_index` and
+    // reaches the same IBR.
+    //
+    // ⛔⛔⛔ AND THE CARD MEASURED IT THROUGH **THIS** DOOR, WHICH IS WHERE THE CUT BELOW COMES FROM.
+    // `bake_py embedding_granite` (`Program::ScalarMul` over a `[256, 4096]` gathered row tile,
+    // `page = 1`, so 256 entries against a 32-entry stick) baked clean, `dxp_standalone --bundle`
+    // exited 0, the launch returned rc=0 in 0.265 s — and every output row `r` held table row
+    // `ids[r mod 32]`:
+    //
+    //   rows[0:32]    within_2pct_strict = 1.000000   (131072 elements, max|err| 0.0625 = f16 ulp)
+    //   rows[32:64]   within_2pct_strict = 0.006226
+    //   rows[0:256]   within_2pct_strict = 0.130597   ~= 32/256, and 256/256 rows fit `r mod 32`
+    //
+    // The whole tensor had the RIGHT rms (11.9603 against the reference's 11.9844) because a
+    // vocabulary's rows are independent `randn` draws, so a bare "does it look like an embedding"
+    // check passes it — which is why the ceiling is a build-time fact and not a review note.
+    //
+    // ⭐ AND IT PROVED THE REST OF THE EMISSION CORRECT, which is what made the remedy a CUT and not a
+    // rewrite: rows 0..31 were EXACT, so the cross-linked alloc pair, `skip_addr = page x out` = one
+    // table row, the `Role::Index`/`SenUint32` declaration, the row-major residency a `mb`-pinned value
+    // tensor implies, and the stick-major output were all already right. Only the ENTRY COUNT was
+    // wrong.
+    //
+    // ⭐⭐⭐⭐⭐ THE CUT: ONE OP PER INDEX STICK, EACH WRITING A **ROW WINDOW** OF THE OUTPUT IN PLACE.
+    //
+    // Each leg declares `cap` entries (one IBR stick), reads index words `[k·cap, (k+1)·cap)` and
+    // writes rows `[k·cap, (k+1)·cap)` of the output. MEASURED on the card, `emb256_rowwin_D`, all
+    // eight row-blocks of `embedding_granite` against the fixture's own `ref_out.bin`:
+    //
+    //   rows[0:32] … rows[224:256]   within_2pct_strict = 1.000000   (131072 elements each)
+    //   rows[0:256]                  within_2pct_strict = 1.000000   max|err| 0.0625 = the f16 ulp
+    //
+    // ⛔⛔⛔ AND TWO OTHER WAYS OF WRITING THAT WINDOW ARE ON THE RECORD AS WRONG, because each of them
+    // is the obvious one and neither faults:
+    //
+    // (a) A **ROW-MAJOR SCRATCH** plus a `restickify` — the shape this refusal used to name. Forcing
+    //     the leg's destination to address `Flat` gives a per-core start of `c·cols·2` (8192 B) while
+    //     `stickDimOrder_` still says `out`, so the two disagree about every byte above one stick and
+    //     the card raises `RAS::PCI::BusFence` 0xa35e ("PCIe bus master fence") at prepare — measured,
+    //     deterministically, at segment 0 AND at segment 4 (so it is the addressing, not the segment)
+    //     and with the restickify REMOVED (so it is not the relayout). The eight-leg bundle is
+    //     otherwise byte-identical and runs.
+    //
+    // (b) Pinning the row count in **`maxDimSizes_`**. `[256, -1]` and `[256, 4096]` both run and both
+    //     give `within_2pct_strict = 0.017013` over the whole tensor. Read off the card's own bytes:
+    //     the row-window BASE is honoured (device run `32k` holds `ids[32k]`'s plane 0 for every k) and
+    //     only the stick-PLANE stride is wrong — 32 rows instead of 256 — so leg `k`'s plane `s` lands
+    //     at run `32·(k+s)` and run 512 held leg 7's plane 9, exactly as that predicts.
+    //
+    // ⭐⭐⭐ SO THE RESIDENCY EXTENT dxp RECONSTRUCTS FROM IS **`N_`**, AND THAT IS THE ONE THING A LEG
+    // HAS TO SAY DIFFERENTLY. `maxDimSizes_ = -1` means "reconstruct the stick-blocked `device_size`
+    // from `N_`/`layoutDimOrder_`/`stickSize_`", and it is `N_`'s `mb_` that the reconstruction reads —
+    // so a leg's `N_` carries the OUTPUT TENSOR's row count while its WORK division
+    // (`numWkSlicesPerDim_`, `dataStageParam_.ss_`/`el_`, the per-core starts 128 B apart, the index's
+    // own 32-entry `N_`/`stickSize_`) carries the leg's own 32 rows. Everything else — including this
+    // crate's own `StickLayout` for the view — is left describing the leg, which is what makes the
+    // change one number rather than a second layout.
+    let rows_per_op = cap.checked_mul(page.get()).ok_or_else(|| {
+        SuperDscError(format!(
+            "{op_name}: a {cap}-entry index stick at {} position(s) per entry overflows a row count",
+            page.get()
+        ))
+    })?;
+    let legs = rows.div_ceil(rows_per_op);
+    let mut ops: Vec<EmittedOp> = Vec::with_capacity(legs as usize);
+    let mut first_row = 0u32;
+    for k in 0..legs {
+        // The LAST leg may be SHORT, and a short index run is the vendor's own shape — both fixtures
+        // declare a sub-stick index extent (`test_gather_1core` at 3 entries), and
+        // `GatherScratch::copies` cuts its final run the same way
+        // (`(rows - first).min(ENTRIES_PER_OP)`).
+        let leg_rows = (rows - first_row).min(rows_per_op);
+        let leg_name = format!("{op_name}_g{k}");
+        ops.push(one_gathered_leg(
+            GatherLeg {
+                op_name,
+                leg_name: &leg_name,
+                tile_op,
+                op_func,
+                leg_rows,
+                node_rows: rows,
+                first_row,
+                cols,
+                inputs,
+                gathered_input,
+                index_name,
+                page,
+                // ⭐ THE RUN'S BASE IN THE INDEX TENSOR — a STICK count, which is what `EntryBase` is.
+                // Leg `k` reads index words `[k·cap, k·cap + leg_rows/page)`, and dropping this is
+                // every leg reading leg 0's entries (the `EntryBase` type exists because that
+                // happened). MEASURED: leg `k`'s index `allocate` starts 128 B = one 32-entry
+                // `SenUint32` stick further on than leg `k-1`'s, for all eight.
+                first_entry: crate::superdsc_opspec::EntryBase::of_sticks(k),
+                o_name: o.name(),
+                head_major,
+            },
+            sym_id_base,
+            layout,
+        )?);
+        first_row += leg_rows;
+    }
+    Ok(ops)
+}
+
+/// ONE LEG of a gathered pointwise op — the whole node when the index fits one stick, and one index
+/// stick's worth of rows when it does not. See [`assemble_pointwise_broadcast_gather`], whose body this
+/// is; it takes a struct because the leg carries fourteen quantities and the sibling assemblers'
+/// `#[allow(clippy::too_many_arguments)]` is not a convention worth extending.
+struct GatherLeg<'a> {
+    /// The NODE's descriptor name — used in refusals, so a leg's diagnostic names the op the program
+    /// stated and not only the synthetic leg spelling.
+    op_name: &'a str,
+    /// THIS leg's descriptor name (`{op_name}_g{k}`, or `op_name` itself for an uncut op).
+    leg_name: &'a str,
+    tile_op: &'a crate::ir::island::tile_op::TileOp,
+    op_func: &'static str,
+    /// The leg's OWN row count — its work, and `<= CopyDims::ENTRIES_PER_OP * page`.
+    leg_rows: u32,
+    /// The OUTPUT TENSOR's row count — its residency, and what `N_` must carry. Equal to `leg_rows`
+    /// for an uncut op, in which case nothing below is rewritten.
+    node_rows: u32,
+    /// Which row of the output this leg starts at (`k * leg_rows`).
+    first_row: u32,
+    cols: u32,
+    inputs: &'a [EwOperand<'a>],
+    gathered_input: usize,
+    index_name: &'a str,
+    page: crate::superdsc_opspec::PageExtent,
+    first_entry: crate::superdsc_opspec::EntryBase,
+    o_name: &'a str,
+    head_major: bool,
+}
+
+fn one_gathered_leg(
+    leg: GatherLeg<'_>,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, SuperDscError> {
+    let GatherLeg {
+        op_name,
+        leg_name,
         tile_op,
-        rows,
+        op_func,
+        leg_rows,
+        node_rows,
+        first_row,
+        cols,
+        inputs,
+        gathered_input,
+        index_name,
+        page,
+        first_entry,
+        o_name,
+        head_major,
+    } = leg;
+    // ⭐ THE LEG'S OWN TILE IS THE NODE'S TILE WITH `mb` AT THE LEG'S ROW COUNT, and nothing else
+    // moved. The tile is the program's statement of the axis NAMES the gather's pin resolves against
+    // (which is why the caller passes a tile rather than `rows`/`cols`), so rebuilding one here would
+    // be a second, unwitnessed declaration; overriding the one extent the cut changes is not.
+    let leg_tile = crate::ir::island::tile_op::TileOp {
+        kind: tile_op.kind,
+        dims: tile_op
+            .dims
+            .iter()
+            .map(|d| {
+                if d.name == "mb" {
+                    crate::superdsc_opspec::ItDim {
+                        size: leg_rows,
+                        ..*d
+                    }
+                } else {
+                    *d
+                }
+            })
+            .collect(),
+        df: tile_op.df,
+    };
+    let mut op = pointwise_broadcast_opspec_from_tile(
+        &leg_tile,
+        leg_rows,
         cols,
         op_func_from_str(op_func),
         inputs,
-        o.name(),
+        o_name,
+        // ⛔ ZERO, ALWAYS — the row-window base is applied BELOW and not here. See
+        // `AnyTensorArg::set_offset_elems`: this builder reads `out_offset` to decide the operand
+        // RANK, and a row window is not the whole-block shift its stick-major (rank-2) form requires,
+        // so passing it here would drop the leg to the rank-3 flat presentation.
         0,
         head_major,
     )
     .map_err(SuperDscError)?;
+    // ⭐⭐⭐ THE ROW WINDOW: THE ONLY BYTE OF THE OUTPUT OPERAND THE CUT MOVES.
+    //
+    // Row `r` of a stick-major `[R, C]` tensor begins at element `r · lanes` (its column-0 lane of
+    // stick plane 0) — `C` does not enter, because the plane stride is what carries the columns. So
+    // leg `k`'s base is `first_row · lanes`, NOT `first_row · cols`.
+    //
+    // ⛔ IT GOES THROUGH `AnyTensorArg::set_offset_elems` (which already existed, for the fused
+    // epilogue's per-head slice) RATHER THAN THROUGH THE BUILDER'S `out_offset`, and that is not a
+    // style choice. `pointwise_broadcast_opspec_from_tile` reads `out_offset` to decide the operand
+    // RANK: its stick-major (rank-2) presentation requires the offset to be "an exact multiple of
+    // rows·cols", the whole-BLOCK shift. `first_row · lanes` is not one, so passing it there would
+    // silently drop the leg to the rank-3 flat form — a different descriptor from the one the card
+    // proved. Setting it here leaves the rank, the two sibling operands and the work division exactly
+    // as the uncut op declares them.
+    if first_row > 0 {
+        let lanes = tile_op.df.elems_per_stick();
+        let off = first_row.checked_mul(lanes).ok_or_else(|| {
+            SuperDscError(format!(
+                "{op_name}: leg `{leg_name}`'s row base {first_row} x {lanes} lanes overflows an \
+                 element offset"
+            ))
+        })?;
+        op.args
+            .last_mut()
+            .ok_or_else(|| {
+                SuperDscError(format!(
+                    "{op_name}: leg `{leg_name}` has no operands, so it has no destination to move"
+                ))
+            })?
+            .set_offset_elems(off);
+    }
     // `inputs` are args `0..inputs.len()` and the output is pushed last, so an input's index IS its arg
     // position — the same identity `emit_sdsc` relies on for `Tensor{i}-idx{i}`.
     let ia = op
@@ -815,13 +1079,11 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
                 // ⭐ THE OP'S OWN ROW AXIS. One entry per row is what a table lookup IS.
                 entry_dim: crate::superdsc_opspec::KernelAxis::Batch,
                 // ⭐ ONE POSITION — an entry is one row, so `skip_addr` is one row's `cols` elements.
-                page: crate::superdsc_opspec::PageExtent::single_position(),
+                page,
                 // ⛔ NO SECOND PAGED AXIS. `out` is the factor `skip_addr` is made of; pinning it too
                 // would collapse an entry to a single element.
                 per_position: None,
-                // The whole index tensor. This op is not cut into one-stick runs — the entry count is
-                // the node's row count, checked against the index buffer's own view by the caller.
-                first_entry: crate::superdsc_opspec::EntryBase::ZERO,
+                first_entry,
             },
             gathered_input,
         )
@@ -832,6 +1094,35 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
                  into whole entries. Both are properties of the tile the program states."
             ))
         })?;
+    // ⛔⛔⛔⛔⛔ ONE LEG'S INDEX IS ONE STICK, AND THIS IS THE GUARD THE CARD WROTE — kept on the op that
+    // DECLARES the index, not only at the caller that counts the entries. The measurement is in
+    // [`assemble_pointwise_broadcast_gather`]'s own note; this is the same law asserted where the
+    // declaration is made, so a future leg-builder cannot reintroduce the wrap by handing this function
+    // a longer run. It is unreachable from the cut by construction
+    // (`leg_rows <= ENTRIES_PER_OP * page`), which is what makes it a proof and not a path.
+    let entries = ia.page.entries_in(leg_rows).ok_or_else(|| {
+        SuperDscError(format!(
+            "{op_name}: the gather pages `{}` by {} position(s) and leg `{leg_name}`'s extent along it \
+             is {leg_rows}, which does not divide into whole entries — a partial entry is an address.",
+            ia.entry_dim.dim(),
+            ia.page.get(),
+        ))
+    })?;
+    let cap = crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP;
+    if entries > cap {
+        return Err(SuperDscError(format!(
+            "{op_name}: leg `{leg_name}` declares {entries} index entries ({leg_rows} `{}` \
+             position(s) / a {}-position page), and ONE gather op's index is ONE {cap}-entry stick. \
+             dxp fills the L3LU IBR with a single stick transfer and each core indexes it at its own \
+             work-slice word, so entries past the first {cap} WRAP — MEASURED on the card through this \
+             door: every output row `r` held the row `ids[r mod {cap}]` names, rows 0..{} exact and \
+             the whole tensor at 0.130597 with the right rms. Cut the node into one leg per index \
+             stick.",
+            ia.entry_dim.dim(),
+            ia.page.get(),
+            cap - 1,
+        )));
+    }
     // ⛔⛔⛔ ONLY THE ENTRY AXIS MAY CARRY A SPLIT, AND THIS IS THE HALF OF `gather_copy_opspec`'S
     // REASONING THAT TRANSFERS TO ANY GATHER.
     //
@@ -865,7 +1156,7 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
         .find(|d| d.name != entry_axis && op.iter.split_of(d.name) > 1)
     {
         return Err(SuperDscError(format!(
-            "{op_name}: this op's work division splits `{}` {} ways, and only the entry axis \
+            "{op_name}: leg `{leg_name}`'s work division splits `{}` {} ways, and only the entry axis \
              (`{entry_axis}`) may carry a split. dxp derives `skip_addr` from the PER-CORE extents of \
              the unpinned dims, so a split elsewhere shrinks what one index entry covers — every index \
              step then lands a fraction of a row short, from a clean bake. Give the op enough rows for \
@@ -875,7 +1166,39 @@ pub fn assemble_pointwise_broadcast_gather<O: KindTag>(
         )));
     }
     let folds = SdscFoldSet::new(op.iter.cores_used());
-    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
+    let mut emitted = emit_sdsc_tiled(leg_name, &op, &folds, sym_id_base, layout)?;
+    // ⭐⭐⭐⭐⭐ `N_` CARRIES THE **TENSOR'S** ROW COUNT, NOT THE LEG'S — THE ONE NUMBER THE CUT CHANGES
+    // ABOUT THE WIRE, AND THE CARD DECIDED IT.
+    //
+    // `maxDimSizes_ = -1` on a stick-blocked operand means "reconstruct the `device_size` from
+    // `N_`/`layoutDimOrder_`/`stickSize_`", and the extent that reconstruction reads for the stick-GROUP
+    // stride is `N_`'s `mb_`. A leg iterates 32 rows of a 256-row tensor, so the two differ — and left
+    // at the leg's own 32 the card strides each stick plane by 32 rows: leg `k`'s plane `s` lands at
+    // device run `32·(k+s)`, the eight windows pile up, and `within_2pct_strict` is 0.017013 over the
+    // whole tensor with the right rms and no fault. Read off the card's own bytes, run 512 held leg 7's
+    // plane 9, exactly as that stride predicts. Pinning the row count in `maxDimSizes_` instead
+    // (`[256, -1]` and `[256, 4096]`) moved NOTHING — both give the same 0.017013.
+    //
+    // At the tensor's 256 all eight blocks are EXACT: `within_2pct_strict = 1.000000` per 32-row block
+    // and over all 1048576 elements, `max|err|` 0.0625 = the fp16 ulp, against the fixture's own
+    // `ref_out.bin` — `emb256_rowwin_D` on pod `nickm3-5999dffbdf-t2wcl`.
+    //
+    // ⛔ ONLY `N_`, AND THAT IS NOT AN OVERSIGHT. `numWkSlicesPerDim_`, `coreIdToWkSlice_` and
+    // `dataStageParam_.ss_`/`el_` keep the LEG's 32 rows — they are its WORK, and the measurement above
+    // was taken with exactly that split — as do the per-core start addresses (128 B apart, the
+    // stick-major column-0 corner, which is the same number under either row count) and the index's own
+    // 32-entry `N_`/`stickSize_`. Rewriting the plan instead would divide 256 by 32 cores and give each
+    // core 8 rows, which is a different op.
+    if node_rows != leg_rows
+        && let Some(dsc) = emitted.op.as_mut()
+    {
+        for dsc_map in dsc.dscs_.iter_mut() {
+            for d in dsc_map.values_mut() {
+                set_iter_dim(&mut d.N_, entry_axis, node_rows);
+            }
+        }
+    }
+    Ok(emitted)
 }
 
 /// The per-chunk OUTPUT column offset (in elements) the emitter must apply for a
@@ -3640,8 +3963,19 @@ mod transpose_tests {
     }
 
     /// THE CONTROL, and the proof that the entry point is not simply broken: the same transpose padded
-    /// to whole sticks lowers, and it lowers to exactly ONE descriptor named after its output buffer,
-    /// carrying the fixture's OUTPUT stick.
+    /// to whole sticks lowers, and it lowers to exactly ONE descriptor named after its output buffer.
+    ///
+    /// ⛔⛔⛔ IT IS A `ReStickifyOpHBM`, NOT AN `interslicetranspose_fp16`, AND THAT IS THE WHOLE POINT
+    /// OF THE REROUTE. `OpFunc::Transpose` sticks its output on the 8×8 inter-slice block over
+    /// (`out`, `mb`) — TWO dims — and the V3 translator accepts a dynamic mask over exactly ONE loop
+    /// carrying exactly ONE dim (`SNComputeLowering.cpp:68,74`), so it could not be lowered at the
+    /// default RCUDD1A arch at ANY shape. `OpFunc::Restickify` does the same transposition with a
+    /// one-dim output stick. See [`restickify_transpose_opspec_2d`], which states the addressing
+    /// argument, and `tests/zz_the_transpose_door_carries_a_two_dim_output_stick.rs`, which pins both doors.
+    ///
+    /// The two roles' dim orders are asserted SWAPPED as well as the stick being one-dim: equal orders
+    /// would be a re-stick with no transposition, which carries the same one-dim stick and would pass
+    /// the stick assertion alone.
     #[test]
     fn the_entry_point_still_lowers_a_stick_aligned_transpose() {
         let ops = lower_transpose(&transpose_program((MB as i64, 128), (128, MB as i64)))
@@ -3654,8 +3988,23 @@ mod transpose_tests {
             "named after its output buffer"
         );
         let d = dsc(op, "transpose_o102");
-        assert_eq!(d.primaryDsInfo_["OUTPUT"].stickSize_, vec![8, 8]);
-        assert_eq!(d.computeOp_[0].opFuncName, "interslicetranspose_fp16");
+        assert_eq!(
+            d.primaryDsInfo_["OUTPUT"].stickDimOrder_,
+            vec!["y"],
+            "the OUTPUT stick must be ONE dim — the only property the V3 translator's limit is a \
+             function of",
+        );
+        assert_eq!(d.primaryDsInfo_["OUTPUT"].stickSize_, vec![64]);
+        assert_eq!(
+            (
+                d.primaryDsInfo_["INPUT"].layoutDimOrder_.clone(),
+                d.primaryDsInfo_["OUTPUT"].layoutDimOrder_.clone(),
+            ),
+            (vec!["y", "out"], vec!["out", "y"]),
+            "the two roles' dim orders must be SWAPPED — that swap IS the transposition, and equal \
+             orders would be a re-stick that copies",
+        );
+        assert_eq!(d.computeOp_[0].opFuncName, "ReStickifyOpHBM");
     }
 
     /// A column extent that is not a whole stick is refused at the entry point too, and the message
@@ -3682,21 +4031,46 @@ mod transpose_tests {
         );
     }
 
-    /// ⛔ AND THE DIVISION GUARD REACHES THE ENTRY POINT AS AN `Error`, NOT A PANIC. `assemble_transpose`
-    /// `panic!`s on a refused opspec, so a shape that passes the stick law but trips the core-division
-    /// guard would abort the build with a bare panic instead of a producer-reportable error. `mb = 64`
-    /// is exactly that shape: whole sticks on both axes, per-core mb 2.
+    /// ⛔ AND THE BUILDER'S OWN GUARD REACHES THE ENTRY POINT AS AN `Error`, NOT A PANIC. Every
+    /// `assemble_*` here `panic!`s on a refused opspec, so a shape that passes the stick law and then
+    /// trips a builder law would abort the build with a bare panic instead of a producer-reportable
+    /// error; the door calls the fallible form for exactly that reason.
+    ///
+    /// ⚖️ THE LAW BEING TRIPPED CHANGED WITH THE REROUTE, AND THAT IS WHY THIS SHAPE DID. It used to be
+    /// `transpose_opspec`'s 8×8 core-division guard, reached at `mb = 64` (per-core mb 2). The door now
+    /// emits a `ReStickifyOpHBM`, which has no block law — `[64, 128]` is one of the shapes the reroute
+    /// exists to make lower — so the remaining builder law is the LX budget: a restickify carries
+    /// `time_tile: None` (its output stick IS the whole `y` extent, so there is no stick dim left to
+    /// divide in time) and therefore cannot tile its way out of an over-budget tile. `[4096, 4096]` is
+    /// that shape: `distribute_cores` spends all 32 cores on `y`, leaving each one (y 128, out 4096) =
+    /// 2_097_152 B against the 1_677_721-B scratchpad.
     #[test]
-    fn a_stick_aligned_shape_whose_division_misses_the_block_is_an_error_not_a_panic() {
-        let e = refusal(&transpose_program((64, 128), (128, 64)));
+    fn a_stick_aligned_shape_whose_builder_law_fails_is_an_error_not_a_panic() {
+        let e = refusal(&transpose_program((4096, 4096), (4096, 4096)));
         assert!(
-            e.contains("(mb 2, out 128)"),
-            "the division guard's own message reaches the caller, got: {e}"
+            e.contains("(y 128, out 4096)"),
+            "the builder's own per-core tile reaches the caller, got: {e}"
         );
         assert!(
-            e.contains("8x8 inter-slice block"),
-            "and names the block law, got: {e}"
+            e.contains("1677721") && e.contains("time_tile"),
+            "and names the budget AND why this door cannot time-tile instead, got: {e}"
         );
+    }
+
+    /// ⭐ THE CONTROL FOR THE SHAPE THE REROUTE EXISTS FOR. `[64, 128]` used to be refused by the 8×8
+    /// core-division guard (per-core mb 2) and is exactly the class `decoder_layer_one_flat` needs; it
+    /// now emits, with the one-dim stick. Without this the test above would read as "big shapes are
+    /// refused" and would not record that the small one was UNBLOCKED.
+    #[test]
+    fn the_shape_the_block_division_used_to_refuse_now_lowers() {
+        let ops = lower_transpose(&transpose_program((64, 128), (128, 64)))
+            .expect("[64, 128] is the shape class the reroute unblocks");
+        let [op] = &ops[..] else {
+            panic!("a transpose is ONE descriptor, got {}", ops.len());
+        };
+        let d = dsc(op, "transpose_o102");
+        assert_eq!(d.primaryDsInfo_["OUTPUT"].stickDimOrder_, vec!["y"]);
+        assert_eq!(d.computeOp_[0].opFuncName, "ReStickifyOpHBM");
     }
 
     // ── (iii) the byte-identity control ──────────────────────────────────────────────────────────
@@ -4163,6 +4537,87 @@ pub fn assemble_restickify_kt_2d(
     let folds = SdscFoldSet::new(op.iter.cores_used());
     emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout)
         .unwrap_or_else(|e| panic!("assemble_restickify_kt_2d {op_name}: {e}"))
+}
+
+/// A STANDALONE `[rows, cols] → [cols, rows]` fp16 TRANSPOSE ON THE RESTICKIFY DOOR — the form
+/// [`lower_ktir_to_superdsc::transpose`] emits for a producer's `linalg.transpose`.
+///
+/// ⛔⛔⛔ WHY THIS DOOR AND NOT [`transpose_opspec`], WHICH IS NAMED FOR THE JOB. `OpFunc::Transpose`
+/// (`interslicetranspose_fp16`) sticks its OUTPUT on the 8×8 inter-slice block over (`out`, `mb`) —
+/// `emit_sdsc`'s `is_transpose_out` arm, `stickDimOrder_ ["out","mb"]`. A TWO-DIM output stick is what
+/// the V3 translator cannot lower: `Ddc::transformForInterSliceRestickify`
+/// (`ddc/ddc_transformation.cpp:2398`, unconditional from `Ddc::run_v1`) fires on any PT node whose
+/// input and output stick orders differ and writes one mask offset per dim of the innermost loop
+/// carrying `outputStickDimOrder[0]`, which for a 2-D (`mb`, `out`) tile is the FUSED
+/// `loop_dsX_dsY_out_mb` — two dims — while `SNComputeLowering::constructDynamicMasking` accepts
+/// exactly one loop carrying exactly one dim (`SNComputeLowering.cpp:68,74`). Measured through
+/// `dxp_standalone`: `OpFunc::Transpose` refuses at EVERY shape, including shapes whose core division
+/// splits both axes like the golden `sdsc_interslicetranspose.json`, which is what ruled the core
+/// division out as the cause. `OpFunc::Restickify` sticks its output on the single `y` axis, DDC lands
+/// on a one-dim loop, and the same masked-MACC path is accepted — exit 0.
+///
+/// ⭐ AND THE ADDRESSING IS THE LADDER'S OWN CONVENTION, which is why the substitution is sound and not
+/// merely translatable. [`restickify_kt_opspec_2d`] reads its input as `[y=rows, out=cols]` sticked on
+/// the LAST dim ⇒ `dev_off([rows,cols],1,·)` = `[cols/64, rows, 64]`, and writes `[out=cols, y=rows]`
+/// sticked on ITS last dim ⇒ `[rows/64, cols, 64]`. That stick-major form IS the fp16 device layout
+/// every operand on this path already carries, so both sides read and write bytes the rest of the
+/// bundle addresses identically — with the axes swapped, which is the transposition.
+///
+/// The extents are plain `u32` here rather than the paged-KV
+/// [`KtTileSlots`](crate::sdsc_abstract::KtTileSlots)/[`KtTileFeats`](crate::sdsc_abstract::KtTileFeats)
+/// newtypes [`assemble_restickify_kt_2d`] takes: this door serves an arbitrary producer-stated shape,
+/// which is exactly the thing those newtypes exist to forbid for the cache. Offsets are zero — a
+/// `linalg.transpose` names whole buffers (its caller refuses a window).
+fn restickify_transpose_opspec_2d(
+    rows: u32,
+    cols: u32,
+    in_name: &str,
+    o_name: &str,
+) -> Result<OpSpec, String> {
+    // The Kᵀ builder IS this descriptor: `cap`→`y` is the row axis, `hd`→`out` the column axis, and
+    // both stick laws are checked there. Sharing it means the two doors cannot drift apart.
+    let op = restickify_kt_opspec_2d(rows, cols, in_name, o_name, 0, 0)?;
+    // ⛔⛔⛔ AND IT MUST FAIL CLOSED ON LX, BECAUSE THIS DOOR CANNOT TIME-TILE ITS WAY OUT.
+    //
+    // `transpose_opspec` reached `TileOp::tile`, which splits the `out` stick dim in TIME when the
+    // per-core tile overflows the scratchpad. A restickify has no such axis to give: its output stick
+    // IS the whole `y` extent, so dividing `y` in time would split an output stick, and
+    // `restickify_kt_opspec_2d` therefore carries `time_tile: None`. So the reroute genuinely narrows
+    // what this door accepts, and the narrowing has to be a NAMED REFUSAL — otherwise a big transpose
+    // becomes a descriptor that addresses past LX and dies on-card as DtException 1535.
+    //
+    // The resident set is the 1 input + 1 output per-core tile, which for a relayout are the same
+    // extents on both sides (the swap is in the addressing, not the size).
+    let (per_y, per_out) = (op.iter.per_core_extent("y"), op.iter.per_core_extent("out"));
+    let resident = 2 * u64::from(per_y) * u64::from(per_out) * u64::from(Fp16::WORD_LENGTH);
+    if resident > USABLE_LX_BYTES {
+        return Err(format!(
+            "restickify transpose [{rows}, {cols}]: the per-core tile is (y {per_y}, out {per_out}) \
+             on {} cores, so the resident input+output set is {resident} B against the \
+             {USABLE_LX_BYTES}-B LX scratchpad. This door carries `time_tile: None` and cannot be \
+             time-tiled instead — a restickify's output stick IS the whole `y` extent, so there is no \
+             stick dim left to divide in time without splitting an output stick. Transpose a narrower \
+             column block and loop, which keeps each descriptor's resident set inside LX.",
+            op.iter.cores_used().get(),
+        ));
+    }
+    Ok(op)
+}
+
+/// [`restickify_transpose_opspec_2d`] assembled — the fallible form, because this is reached by a
+/// third-party KTIR producer that has its own op to blame (see [`try_assemble_transpose`]).
+pub fn try_assemble_restickify_transpose_2d(
+    op_name: &str,
+    rows: u32,
+    cols: u32,
+    in_name: &str,
+    o_name: &str,
+    sym_id_base: &mut i64,
+    layout: Option<&BundleLayout>,
+) -> Result<EmittedOp, String> {
+    let op = restickify_transpose_opspec_2d(rows, cols, in_name, o_name)?;
+    let folds = SdscFoldSet::new(op.iter.cores_used());
+    emit_sdsc_tiled(op_name, &op, &folds, sym_id_base, layout).map_err(|e| e.0)
 }
 
 /// PATH B (V side): a RANK-2 per-head restickify that RE-STICKS the natural V cache `[cap,hd]` (flat
@@ -4732,6 +5187,319 @@ mod indirect_access_baseline {
             count(&json, "\"memOrg_\":{\"hbm\":{\"isPresent\":1}}"),
             0,
             "MemOrg::hbm_only is not on this path"
+        );
+    }
+}
+
+/// ⭐⭐⭐⭐⭐ THE GATHER'S CUT — one op per index stick, each writing a ROW WINDOW of the output.
+///
+/// # WHAT THE CARD DECIDED, AND WHY THESE ARE THE PROPERTIES TO PIN
+///
+/// `embedding_granite` is a `[256, 4096]` gathered row tile against a 32-entry `SenUint32` index
+/// stick, so it is EIGHT ops. Four shapes of it were run on pod `nickm3-5999dffbdf-t2wcl` against the
+/// fixture's own `ref_out.bin`, and only the last is right:
+///
+/// ```text
+///   one op, 256 entries          rows[0:32] 1.000000, rows[0:256] 0.130597   every row `ids[r mod 32]`
+///   eight legs, ROW-MAJOR dest   RAS::PCI::BusFence 0xa35e at prepare        (at seg0 AND at seg4)
+///   eight legs, N_.mb_ = 32      rows[0:256] 0.017013                        plane stride 32 rows
+///   eight legs, N_.mb_ = 256     rows[0:256] 1.000000, max|err| 0.0625       8/8 blocks exact
+/// ```
+///
+/// `cargo test` cannot run `dxp_standalone` or a launch. What it CAN pin is every descriptor property
+/// the last line is a function of, so that a change to any of them is a test failure saying "re-run
+/// the card leg" instead of a silent return to one of the first three.
+#[cfg(test)]
+mod gather_cut {
+    use super::*;
+    use crate::ir::island::tile_op::{TileOp, TileOpKind};
+
+    /// `embedding_granite`'s own extents — its `N_TOK` and Granite's `d_model`.
+    const ROWS: u32 = 256;
+    const COLS: u32 = 4096;
+
+    /// One 32-entry index stick.
+    fn cap() -> u32 {
+        crate::sdsc_abstract::CopyDims::ENTRIES_PER_OP
+    }
+
+    /// The `TileOp` `lower_ktir_to_superdsc::scalarmul_at` states for this node: `[mb, out, y]` with
+    /// `out` the stick axis and two live operands (the `[1,1]` scale rides in the op).
+    fn tile(rows: u32) -> TileOp {
+        let d = |name: &'static str, size: u32, is_stick: bool| ItDim {
+            name,
+            size,
+            is_reduction: false,
+            is_stick,
+            df: Df::Fp16,
+        };
+        TileOp {
+            kind: TileOpKind::PointwiseOrReduce { n_operands: 2 },
+            dims: vec![d("mb", rows, false), d("out", COLS, true), d("y", 1, false)],
+            df: Df::Fp16,
+        }
+    }
+
+    /// The door, driven exactly as `scalarmul_at` drives it: the `[1,1]` scale first and the gathered
+    /// table LAST (the one position at which `attach_gather_index`'s insert and dbo's dominance
+    /// requirement coincide). `layout: None` is this crate's unit-test arm, so addresses come from the
+    /// per-arg segment fallback — inert for every property below, which are all DIFFERENCES.
+    fn legs(rows: u32) -> Vec<EmittedOp> {
+        let scale = rbo("t4294967275");
+        let table = rbo("t1");
+        let out = rbo("t2");
+        let t = tile(rows);
+        let mut sid = 0i64;
+        assemble_pointwise_broadcast_gather(
+            PointwiseGather {
+                op_name: "scalarmul_o2",
+                tile_op: &t,
+                op_func: "multiply",
+                rows,
+                cols: COLS,
+                inputs: &[In::scalar(&scale).ew(), In::full(&table).ew()],
+                gathered_input: 1,
+                index_name: "t0",
+                o: &out,
+            },
+            &mut sid,
+            None,
+        )
+        .expect("the cut emits")
+    }
+
+    /// The `dscs_[0]` body of an emitted leg.
+    fn body(op: &EmittedOp) -> &crate::wire::Dsc {
+        op.op
+            .as_ref()
+            .expect("a gather leg carries a descriptor")
+            .dscs_[0]
+            .values()
+            .next()
+            .expect("one dsc per leg")
+    }
+
+    /// The per-core start addresses of operand `lds` of a leg, lowest first. Operand order is
+    /// `[scale, table, index, output]` — the index is INSERTED before the output, so the output is 3.
+    fn starts(op: &EmittedOp, lds: u32) -> Vec<u64> {
+        let node = body(op)
+            .scheduleTree_
+            .iter()
+            .find(|n| n.nodeType_ == "allocate" && n.ldsIdx_ == lds)
+            .expect("an allocate node per operand");
+        let mut v: Vec<u64> = node
+            .startAddressCoreCorelet_
+            .data_
+            .values()
+            .map(|s| s.parse::<u64>().expect("a decimal address"))
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// ⭐ ONE LEG PER INDEX STICK, AND THE ACCEPTING SIDE STILL EMITS ONE OP.
+    ///
+    /// `ENTRIES_PER_OP` is the whole reason the cut exists, so the leg count is asserted as a function
+    /// of it rather than as the literal 8 — a change to that constant must move this test's
+    /// expectation, not break its assertion.
+    #[test]
+    fn the_gather_is_cut_into_one_leg_per_index_stick() {
+        assert_eq!(
+            legs(ROWS).len() as u32,
+            ROWS / cap(),
+            "one leg per index stick"
+        );
+        // ⭐ THE CONTROL THAT MAKES IT A CUT AND NOT A REWRITE: at exactly one stick the door emits the
+        // single whole-node op it always did — the descriptor `embedding_granite_m32` proved on card at
+        // `within_2pct_strict = 1.000000`, and which still bakes BYTE-IDENTICALLY after this change.
+        assert_eq!(legs(cap()).len(), 1, "one index stick is one op");
+        // The leg names distinguish them, because they become the bake's per-file keys.
+        let names: Vec<String> = legs(ROWS).iter().map(|o| o.op_name.clone()).collect();
+        assert_eq!(names.first().map(String::as_str), Some("scalarmul_o2_g0"));
+        assert_eq!(names.last().map(String::as_str), Some("scalarmul_o2_g7"));
+        assert_eq!(
+            legs(cap())[0].op_name,
+            "scalarmul_o2",
+            "an uncut op keeps the node's name"
+        );
+    }
+
+    /// ⭐⭐⭐ `N_`'s `mb_` IS THE **TENSOR'S** ROW COUNT WHILE THE WORK DIVISION IS THE **LEG'S** — the
+    /// one number that moved the card from 0.017013 to 1.000000.
+    ///
+    /// `maxDimSizes_ = -1` means "reconstruct the stick-blocked `device_size` from
+    /// `N_`/`layoutDimOrder_`/`stickSize_`", and it is `N_`'s `mb_` that the reconstruction reads for
+    /// the stick-PLANE stride. At the leg's own 32 the eight row windows overlap — measured off the
+    /// card's own bytes, leg `k`'s plane `s` landing at device run `32·(k+s)`, with run 512 holding
+    /// leg 7's plane 9; at the tensor's 256 all eight land exactly.
+    #[test]
+    fn a_legs_residency_is_the_whole_tensor_and_its_work_division_is_its_own() {
+        for (k, op) in legs(ROWS).iter().enumerate() {
+            let dsc = op.op.as_ref().expect("a descriptor");
+            let d = body(op);
+            assert_eq!(
+                d.N_.mb_, ROWS as i64,
+                "leg {k}: N_ carries the TENSOR's rows"
+            );
+            assert_eq!(d.N_.out_, COLS as i64, "leg {k}: N_ `out` is untouched");
+            // The WORK is the leg's own: `cap` rows over `cap` cores, one row each.
+            assert_eq!(
+                dsc.numWkSlicesPerDim_["mb"],
+                cap(),
+                "leg {k}: the leg's own row split"
+            );
+            assert_eq!(
+                d.dataStageParam_["0"].ss_.mb_, 1,
+                "leg {k}: one row per core"
+            );
+            assert_eq!(
+                d.dataStageParam_["0"].el_.mb_, 1,
+                "leg {k}: one row per core"
+            );
+        }
+        // ⛔ AND AN UNCUT OP IS UNTOUCHED, which is what keeps the m32 descriptor byte-identical: with
+        // one stick there is no window, so `N_` is the plan's own extent exactly as before the cut.
+        assert_eq!(
+            body(&legs(cap())[0]).N_.mb_,
+            cap() as i64,
+            "an uncut op's N_ is its own extent"
+        );
+    }
+
+    /// ⭐⭐⭐ EACH LEG READS ITS OWN INDEX STICK — `EntryBase::of_sticks(k)`. Without it every leg reads
+    /// leg 0's entries, which is 32 right rows and 224 wrong ones: exactly the `ids[r mod 32]` the
+    /// un-cut op measured at 0.130597.
+    ///
+    /// One 32-entry `SenUint32` stick is 128 B, so consecutive legs' index allocations are exactly that
+    /// far apart. And the index is UNSPLIT — dxp gives `arrayB` no per-core HBM offset at all
+    /// (`progCorrection.cpp:524`), so every core of a leg shares ONE address.
+    #[test]
+    fn each_leg_reads_the_next_index_stick_and_all_its_cores_share_it() {
+        let stick_bytes = u64::from(cap())
+            * u64::from(<crate::superdsc_opspec::SenUint32 as DataFormat>::WORD_LENGTH);
+        assert_eq!(stick_bytes, 128, "a 32-entry int32 IBR stick is 128 B");
+        let ops = legs(ROWS);
+        let bases: Vec<u64> = ops
+            .iter()
+            .map(|o| {
+                let s = starts(o, 2);
+                assert!(
+                    s.iter().all(|&a| a == s[0]),
+                    "the index is UNSPLIT: every core reads one address"
+                );
+                s[0]
+            })
+            .collect();
+        for k in 1..bases.len() {
+            assert_eq!(
+                bases[k] - bases[k - 1],
+                stick_bytes,
+                "leg {k} reads the NEXT index stick"
+            );
+        }
+    }
+
+    /// ⭐⭐⭐ EACH LEG WRITES THE NEXT ROW WINDOW — `first_row · lanes`, NOT `first_row · cols`.
+    ///
+    /// Row `r` of a stick-major `[R, C]` tensor begins at element `r · lanes` (its column-0 lane of
+    /// plane 0); `C` does not enter, because the plane stride carries the columns. So consecutive legs'
+    /// destinations are `ENTRIES_PER_OP · lanes · 2` bytes apart — 4096 for fp16 — and NOT the
+    /// whole-block `ENTRIES_PER_OP · cols · 2` = 262144, which is what an eight-BLOCK output would be
+    /// and which the host would then have to de-block. Both forms bake and neither faults; the card
+    /// separates them (the block form scores 0.014110 read as a `[256, 4096]` tensor).
+    #[test]
+    fn each_leg_writes_the_next_row_window_of_the_output() {
+        let lanes = u64::from(Fp16::ELEMS_PER_STICK);
+        let w = u64::from(Fp16::WORD_LENGTH);
+        let ops = legs(ROWS);
+        let bases: Vec<u64> = ops.iter().map(|o| starts(o, 3)[0]).collect();
+        let window = u64::from(cap()) * lanes * w;
+        let block = u64::from(cap()) * u64::from(COLS) * w;
+        assert_ne!(window, block, "the two candidate strides really differ");
+        for k in 1..bases.len() {
+            assert_eq!(
+                bases[k] - bases[k - 1],
+                window,
+                "leg {k}'s destination is one {}-row WINDOW on, not one block",
+                cap()
+            );
+        }
+        // The per-core step is the stick-major column-0 corner, `lanes · 2` — the same number under
+        // either row count, which is why only `N_` had to change.
+        let s = starts(&ops[0], 3);
+        assert_eq!(s[1] - s[0], lanes * w, "one core per row, stick-major");
+        assert_eq!(s.len() as u32, cap(), "one core per row of the leg");
+    }
+
+    /// ⛔⛔⛔ THE 32-ENTRY CEILING IS STILL ENFORCED ON THE OP THAT DECLARES THE INDEX, and the cut did
+    /// not weaken it: `one_gathered_leg` refuses a longer run BY NAME. It is unreachable from the cut
+    /// by construction, so it is reached here with a hand-built over-long leg — which is what makes it
+    /// a proof rather than dead code.
+    ///
+    /// ⭐ AND THE DISCRIMINATING CONTROL IS ONE VARIABLE AWAY: the same leg at one stick emits.
+    #[test]
+    fn a_leg_longer_than_one_index_stick_is_refused_by_name() {
+        let scale = rbo("t4294967275");
+        let table = rbo("t1");
+        let ins = [In::scalar(&scale).ew(), In::full(&table).ew()];
+        let two = tile(cap() * 2);
+        let mut sid = 0i64;
+        let e = match one_gathered_leg(
+            GatherLeg {
+                op_name: "scalarmul_o2",
+                leg_name: "scalarmul_o2_g0",
+                tile_op: &two,
+                op_func: "multiply",
+                leg_rows: cap() * 2,
+                node_rows: cap() * 2,
+                first_row: 0,
+                cols: COLS,
+                inputs: &ins,
+                gathered_input: 1,
+                index_name: "t0",
+                page: crate::superdsc_opspec::PageExtent::single_position(),
+                first_entry: crate::superdsc_opspec::EntryBase::ZERO,
+                o_name: "t2",
+                head_major: false,
+            },
+            &mut sid,
+            None,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("two index sticks in one leg must be refused"),
+        };
+        assert!(
+            e.0.contains(&format!("{} index entries", cap() * 2)) && e.0.contains("ONE gather op"),
+            "the refusal names the entry count and the one-stick law: {}",
+            e.0
+        );
+        // THE DISCRIMINATING CONTROL, one variable away: the SAME leg at one stick emits.
+        let one = tile(cap());
+        let mut sid = 0i64;
+        assert!(
+            one_gathered_leg(
+                GatherLeg {
+                    op_name: "scalarmul_o2",
+                    leg_name: "scalarmul_o2_g0",
+                    tile_op: &one,
+                    op_func: "multiply",
+                    leg_rows: cap(),
+                    node_rows: cap(),
+                    first_row: 0,
+                    cols: COLS,
+                    inputs: &ins,
+                    gathered_input: 1,
+                    index_name: "t0",
+                    page: crate::superdsc_opspec::PageExtent::single_position(),
+                    first_entry: crate::superdsc_opspec::EntryBase::ZERO,
+                    o_name: "t2",
+                    head_major: false,
+                },
+                &mut sid,
+                None,
+            )
+            .is_ok(),
+            "one index stick in one leg emits"
         );
     }
 }

@@ -216,6 +216,11 @@ pub enum KernelId {
     /// in `quantized_qmm_nax.metallib`. Only dispatched when
     /// `is_nax_capable(profile.generation)` and `K % 64 == 0`.
     AffineQmmTNax,
+    /// NAX decode-batch matmul: the 4-bit codes as the MPP `matmul2d`
+    /// operand, one threadgroup's rows covering the batch, so each weight is
+    /// read once per 8 or 16 rows. Maps to `affine_qmm_small_m_*` in
+    /// `quantized_qmm_nax.metallib`; runs on `SMALL_M_TOKENS` steps only.
+    AffineQmmSmallM,
     /// NVFP4 int4 decode matvec (generic). Maps to
     /// `nvfp4_qmv_<dtype>_s_<scale>_gs_16_b_4_batch_0` in the
     /// `quantized_qmv.metallib` (nvfp4 kernels share that library with
@@ -436,16 +441,127 @@ pub enum KernelId {
     /// `elementwise.metallib`. Bindings: `(embed @ 0 in/out, mm @ 1,
     /// dst_rows @ 2, hidden inline @ 3)`.
     MmEmbedSplice,
-    /// TurboQuant: dequant a layer's PACKED KV codes into the reused fp16
-    /// scratch (one layer at a time) right BEFORE that layer's attention.
-    /// Maps to `tq_dequant_paged[_bf16]` in `turboquant.metallib`. The packed
-    /// store (canonical, ~4.7x smaller) is the only persistent KV; the scratch
-    /// holds one layer's fp16 for the attention read, then is reused.
-    TqDequantToScratch,
+    /// TurboQuant prefill: write a layer's K (or V) for the step's sequences
+    /// into the reused fp16 scratch in the codebook's ROTATED domain (R·k),
+    /// right before that layer's prefill attention — a table lookup per cached
+    /// key, a Walsh-Hadamard transform per new key. Maps to
+    /// `tq_stage_rotated_{f16,bf16}` in `attention.metallib`. The packed store
+    /// (canonical, ~4.7x smaller) is the only persistent KV; the scratch holds
+    /// one layer's image for the attention read, then is reused.
+    TqStageRotated,
+    /// TurboQuant prefill: rotate the attention's q rows into the codebook
+    /// domain (R·q) before it and its output rows back (Rᵀ·o) after it, in
+    /// place. Maps to `tq_{rotate,unrotate}_rows_{f16,bf16}` in
+    /// `attention.metallib`.
+    TqRotateRows,
     /// TurboQuant: quantize a layer's newly-written KV (in the fp16 scratch)
-    /// into the PACKED store right AFTER that layer's rope-append-cache write.
-    /// Maps to `tq_compress_paged[_bf16]` in `turboquant.metallib`.
+    /// into the PACKED store right after that layer's KV writer. Maps to
+    /// `tq_compress_paged[_bf16]` in `turboquant.metallib`.
     TqQuantizeToPacked,
+    /// TurboQuant decode attention: `AttentionViaCache` reading the packed
+    /// store directly in the codebook domain (function constant 13), so a
+    /// decode step never dequantizes the context. Same symbol as
+    /// `AttentionViaCache`.
+    AttentionViaCacheTq,
+}
+
+/// Which sequences of a step a command computes correctly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeqScope {
+    /// Every sequence: the kernel works token by token, or finds each
+    /// sequence's rows through `cu_seqlens_q` and its own block-table row.
+    AllRows,
+    /// Batch row 0 only: the kernel, or a scratch it binds, holds one
+    /// sequence's state (`seq_used[0]`, `cu_seqlens_q[1] - cu_seqlens_q[0]`,
+    /// or keys staged from row 0). The lowering runs such a command on
+    /// single-sequence steps only, beside a per-row twin for the rest.
+    RowZero,
+}
+
+impl KernelId {
+    /// No wildcard arm: a new kernel must say whether it reads every sequence.
+    pub const fn seq_scope(self) -> SeqScope {
+        match self {
+            Self::RopeOnceNax
+            | Self::RopeOnceSteel
+            | Self::RopeOnceGqaShared
+            | Self::AttnGatherKRope
+            | Self::AttnGatherVCopyT
+            | Self::AttnCausalSoftmax
+            | Self::AttnGemmQk
+            | Self::AttnGemmPv => SeqScope::RowZero,
+            Self::Embed
+            | Self::RmsNorm
+            | Self::RmsNormUnit
+            | Self::ScalarWeightMul
+            | Self::NormAddScalarMul
+            | Self::RopeAppendNormed
+            | Self::FusedAddRmsNorm
+            | Self::Gemm
+            | Self::FusedGateUpSiluMul
+            | Self::RopeAppend
+            | Self::FusedQkvRopeCache
+            | Self::FusedAffineQkvRopeCache
+            | Self::AttentionViaCache
+            | Self::AttentionPrefillSdpaPaged
+            | Self::AttnQConvert
+            | Self::AttnOConvert
+            | Self::ScalarMul
+            | Self::TanhSoftCap
+            | Self::Add
+            | Self::BiasAdd
+            | Self::Reshape
+            | Self::AffineQmvQuad
+            | Self::AffineQmvFast
+            | Self::AffineQmv
+            | Self::AffineQmmT
+            | Self::AffineGatherQmmT
+            | Self::AffineGatherQmmTNax
+            | Self::AffineQmmTSplitK
+            | Self::AffineQmmTNax
+            | Self::AffineQmmSmallM
+            | Self::Nvfp4Qmv
+            | Self::Nvfp4QmmT
+            | Self::Nvfp4QmmTNax
+            | Self::SiluMul
+            | Self::GeluMul
+            | Self::GateApply
+            | Self::GateScale
+            | Self::GateSplit
+            | Self::GatedDeltaNet
+            | Self::SplitKReduceSum
+            | Self::AffineEmbed
+            | Self::SynthPreAttn
+            | Self::SynthMlpPreDown
+            | Self::SynthGateUpSiluMul
+            | Self::GatherLastToken
+            | Self::ScatterFirstToLastRow
+            | Self::Softmax
+            | Self::ArgPartitionTopK
+            | Self::TakeAlongAxis
+            | Self::SliceTrailingColsU32
+            | Self::AffineGatherQmvFast
+            | Self::AffineGatherQmv
+            | Self::MoeWeightedSum
+            | Self::MoeGroupOffsets
+            | Self::MoeGroupInit
+            | Self::MoeGroupScatter
+            | Self::MoeGroupGather
+            | Self::MoePerExpertScale
+            | Self::VisionLayerNorm
+            | Self::VisionRope
+            | Self::VisionVarlenAttn
+            | Self::EmbeddingGather
+            | Self::AvgPool2d
+            | Self::VisionGelu
+            | Self::VisionLoadPixels
+            | Self::MmEmbedSplice
+            | Self::TqStageRotated
+            | Self::TqRotateRows
+            | Self::TqQuantizeToPacked
+            | Self::AttentionViaCacheTq => SeqScope::AllRows,
+        }
+    }
 }
 
 /// `MetalDtype` relocated to the cfg-free `scratchy-tensors` core so
@@ -554,6 +670,53 @@ pub enum RuntimeGate {
     /// but only fire when `kv_cache_dtype == turboquant` (the worker resolves
     /// the tq buffers + the KV scratch only then). No-op on every other run.
     OnlyIfTurboquant,
+    /// Run only on a TurboQuant decode step — every sequence contributes
+    /// exactly one token (`num_tokens == num_seqs`) — the steps whose
+    /// attention is `AttentionViaCacheTq`, reading the packed store directly.
+    OnlyIfTurboquantDecode,
+    /// Run only on a TurboQuant step that is NOT a decode step: the
+    /// rotated-domain K/V staging and q/output rotation around its attention.
+    OnlyIfTurboquantNotDecode,
+    /// Run unless this is a TurboQuant decode step: the attention an
+    /// `AttentionViaCacheTq` twin replaces there.
+    UnlessTurboquantDecode,
+    /// Run only on a step whose token count is in
+    /// `quantized::SMALL_M_TOKENS`: the `AffineQmmSmallM` twin of a GEMM.
+    OnlyIfSmallMTokens,
+    /// Run unless the step's token count is in `quantized::SMALL_M_TOKENS`:
+    /// the GEMM an `AffineQmmSmallM` twin replaces there.
+    UnlessSmallMTokens,
+    /// Run only on a step with one sequence: the prefill attention that reads
+    /// K from the rope-once scratch, which holds one sequence's keys.
+    OnlyIfOneSequence,
+    /// Run only on a step with several sequences: the attention twins that
+    /// read each sequence's K through its own block-table row.
+    UnlessOneSequence,
+    /// Run only on a step whose block tables hold an unrotated (bit-31, span)
+    /// block: the per-row attention twin that re-ropes K as it reads it.
+    OnlyIfUnrotatedBlocks,
+    /// Run unless the step's block tables hold an unrotated block: the
+    /// per-row attention twin that reads the cache's already-roped K as is.
+    UnlessUnrotatedBlocks,
+    /// Run only when every gate in the list matches.
+    All(&'static [RuntimeGate]),
+}
+
+impl RuntimeGate {
+    /// `gate` narrowed by `and`: a command that already carries a gate keeps
+    /// it, and must now also match every gate in `and`.
+    pub fn and(gate: Option<RuntimeGate>, and: &[RuntimeGate]) -> RuntimeGate {
+        let mut all: Vec<RuntimeGate> = match gate {
+            None => Vec::new(),
+            Some(RuntimeGate::All(gs)) => gs.to_vec(),
+            Some(g) => vec![g],
+        };
+        all.extend_from_slice(and);
+        match all.as_slice() {
+            [only] => *only,
+            _ => RuntimeGate::All(baked(all)),
+        }
+    }
 }
 
 impl DispatchShape {
@@ -1099,8 +1262,9 @@ pub enum RuntimeBindingKind {
     /// (`[0..vision_num_positions]` per image). Gemma3-MM.
     VisionPositionIds,
     /// TurboQuant per-layer PACKED key/value code store (canonical KV, ~4.7x
-    /// smaller than fp16). Source for `TqDequantToScratch`, dest for
-    /// `TqQuantizeToPacked`. Worker resolves to `tq_packed_k/v[layer]`.
+    /// smaller than fp16). Source for `TqStageRotated` and
+    /// `AttentionViaCacheTq`, dest for `TqQuantizeToPacked`. Worker resolves
+    /// to `tq_packed_k/v[layer]`.
     TqPackedK {
         layer: LayerId,
     },
@@ -1191,6 +1355,19 @@ impl LoweredCommand {
             dispatch,
             bindings: baked(bindings.into()),
             gemm_dims: None,
+        }
+    }
+
+    /// Row zero if its kernel or any buffer it binds is.
+    pub fn seq_scope(&self) -> SeqScope {
+        match self
+            .bindings
+            .iter()
+            .map(|b| b.seq_scope())
+            .find(|s| *s == SeqScope::RowZero)
+        {
+            Some(row_zero) => row_zero,
+            None => self.kernel.seq_scope(),
         }
     }
 }
@@ -1370,6 +1547,20 @@ impl Binding {
             | Self::AttnUnfusedScratch { .. }
             | Self::Inline { .. }
             | Self::MoeScratch { .. } => self,
+        }
+    }
+
+    /// The rope-once and unfused-attention scratches hold one sequence's keys.
+    pub const fn seq_scope(self) -> SeqScope {
+        match self {
+            Self::RopedKScratch { .. } | Self::AttnUnfusedScratch { .. } => SeqScope::RowZero,
+            Self::ArenaSlot { .. }
+            | Self::Source { .. }
+            | Self::Weight { .. }
+            | Self::Runtime { .. }
+            | Self::Scratch { .. }
+            | Self::Inline { .. }
+            | Self::MoeScratch { .. } => SeqScope::AllRows,
         }
     }
 }
@@ -1563,6 +1754,24 @@ pub enum LoweringError {
         body_len: u32,
         remaining: usize,
     },
+    /// A TurboQuant codec command could not bind the additive offset of the
+    /// KV operand it compresses — quantizing without removing it would let the
+    /// offset's norm, not the signal's, set the codec's error.
+    TurboQuantOffsetUnbound { index: usize, missing: TqUnbound },
+    /// A command computes batch row 0 only ([`SeqScope::RowZero`]) and its
+    /// instruction has no per-row twin re-roping span blocks, so some step with
+    /// several sequences would run no attention, or row 0's for every sequence.
+    RowZeroWithoutPerRowTwin { index: usize, kernel: KernelId },
+}
+
+/// What a TurboQuant codec command at [`LoweringError::TurboQuantOffsetUnbound`]
+/// lacked.
+#[derive(Clone, Copy, Debug)]
+pub enum TqUnbound {
+    /// No KV writer precedes it, so its operands' offsets are unknown.
+    Writer,
+    /// A K bias, with no rotary table bound to rotate it to each key.
+    RotaryTable,
 }
 
 impl std::fmt::Display for LoweringError {
@@ -1586,6 +1795,17 @@ impl std::fmt::Display for LoweringError {
                 f,
                 "lowering: malformed Loop({count}, {body_len}) at tape index {index} \
                  — body extends past tape end (only {remaining} instructions remain)"
+            ),
+            Self::TurboQuantOffsetUnbound { index, missing } => write!(
+                f,
+                "lowering: the TurboQuant command at tape index {index} cannot bind its KV \
+                 operand's additive offset ({missing:?} missing)"
+            ),
+            Self::RowZeroWithoutPerRowTwin { index, kernel } => write!(
+                f,
+                "lowering: `{kernel:?}` at tape index {index} computes sequence 0 only, and \
+                 the instruction has no per-row twin re-roping span blocks for steps with \
+                 several sequences"
             ),
         }
     }
@@ -1681,7 +1901,8 @@ pub struct ScratchPatch {
 /// expansion for a `(generation class, chunked addressing)` pair, with
 /// block-capacity dependence expressed as patches. The pool picks the
 /// matching variant at load and [`Self::materialize`]s it with the
-/// runtime capacity — selection and substitution only, no analysis.
+/// runtime capacity and the device's TurboQuant decode heads — selection
+/// and substitution only, no analysis.
 #[derive(Clone, Copy, PartialEq, serde::Serialize)]
 pub struct ClassedTape {
     pub gen_class: GenClass,
@@ -1706,62 +1927,68 @@ fn patched(floor: u32, base: i64, num: i64, den: u32, round_up: bool, cap: u32) 
 }
 
 impl ClassedTape {
-    /// Substitute the runtime block-table capacity into the baked tape.
-    /// The ONE permitted load-time `baked` site: commands
-    /// whose constants carry a capacity patch are copied once per model
-    /// load; everything else stays the macro-emitted static.
-    pub fn materialize(&self, cap: u32) -> LoweredMetalTape {
+    /// Substitute the runtime block-table capacity, and the query heads
+    /// each TurboQuant decode threadgroup serves on this device
+    /// ([`crate::tape::lowering::serve_tq_decode_heads`]), into the baked
+    /// tape. The ONE permitted load-time `baked` site: the commands are
+    /// copied once per model load.
+    pub fn materialize(
+        &self,
+        cap: u32,
+        tq_heads: crate::tape::ids::TqDecodeHeads,
+    ) -> LoweredMetalTape {
         let mut tape = self.tape;
-        if !self.const_patches.is_empty() {
-            let mut commands: Vec<GatedCommand> = self.tape.commands.to_vec();
-            for p in self.const_patches {
-                let cmd = &mut commands[p.cmd_idx as usize];
-                let v = patched(p.floor, p.base, p.num, p.den, p.round_up, cap);
-                match p.target {
-                    PatchTarget::Constant(i) => {
-                        let mut consts = cmd.command.constants.to_vec();
-                        consts[i as usize].bits = v;
-                        cmd.command.constants = baked(consts);
-                    }
-                    PatchTarget::Threadgroups(ax) => {
-                        let tg = &mut cmd.command.dispatch.threadgroups;
-                        match ax {
-                            0 => tg.0 = v,
-                            1 => tg.1 = v,
-                            _ => tg.2 = v,
-                        }
-                    }
-                    PatchTarget::ThreadsPerThreadgroup(ax) => {
-                        let t = &mut cmd.command.dispatch.threads_per_threadgroup;
-                        match ax {
-                            0 => t.0 = v,
-                            1 => t.1 = v,
-                            _ => t.2 = v,
-                        }
-                    }
-                    PatchTarget::MScalingBucketM => {
-                        let ms = cmd
-                            .command
-                            .dispatch
-                            .m_scaling
-                            .as_mut()
-                            .expect("MScalingBucketM patch on a command without m_scaling");
-                        ms.bucket_m = crate::tape::ids::BucketM(v);
-                    }
-                    PatchTarget::AttnScratchOffset(bi) => {
-                        let mut binds = cmd.command.bindings.to_vec();
-                        match &mut binds[bi as usize] {
-                            Binding::AttnUnfusedScratch { offset, .. } => *offset = v,
-                            other => {
-                                panic!("AttnScratchOffset patch on non-scratch binding {other:?}")
-                            }
-                        }
-                        cmd.command.bindings = baked(binds);
+        let mut commands: Vec<GatedCommand> = self.tape.commands.to_vec();
+        for p in self.const_patches {
+            let cmd = &mut commands[p.cmd_idx as usize];
+            let v = patched(p.floor, p.base, p.num, p.den, p.round_up, cap);
+            match p.target {
+                PatchTarget::Constant(i) => {
+                    let mut consts = cmd.command.constants.to_vec();
+                    consts[i as usize].bits = v;
+                    cmd.command.constants = baked(consts);
+                }
+                PatchTarget::Threadgroups(ax) => {
+                    let tg = &mut cmd.command.dispatch.threadgroups;
+                    match ax {
+                        0 => tg.0 = v,
+                        1 => tg.1 = v,
+                        _ => tg.2 = v,
                     }
                 }
+                PatchTarget::ThreadsPerThreadgroup(ax) => {
+                    let t = &mut cmd.command.dispatch.threads_per_threadgroup;
+                    match ax {
+                        0 => t.0 = v,
+                        1 => t.1 = v,
+                        _ => t.2 = v,
+                    }
+                }
+                PatchTarget::MScalingBucketM => {
+                    let ms = cmd
+                        .command
+                        .dispatch
+                        .m_scaling
+                        .as_mut()
+                        .expect("MScalingBucketM patch on a command without m_scaling");
+                    ms.bucket_m = crate::tape::ids::BucketM(v);
+                }
+                PatchTarget::AttnScratchOffset(bi) => {
+                    let mut binds = cmd.command.bindings.to_vec();
+                    match &mut binds[bi as usize] {
+                        Binding::AttnUnfusedScratch { offset, .. } => *offset = v,
+                        other => {
+                            panic!("AttnScratchOffset patch on non-scratch binding {other:?}")
+                        }
+                    }
+                    cmd.command.bindings = baked(binds);
+                }
             }
-            tape.commands = baked(commands);
         }
+        for cmd in &mut commands {
+            crate::tape::lowering::serve_tq_decode_heads(&mut cmd.command, tq_heads);
+        }
+        tape.commands = baked(commands);
         for p in self.scratch_patches {
             let v = patched(p.floor, p.base, p.num, p.den, p.round_up, cap);
             match p.field {

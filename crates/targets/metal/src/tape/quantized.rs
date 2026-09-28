@@ -486,6 +486,88 @@ pub fn qmm_t_kernel_static_name(
     leaked
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Small-M matrix-unit GEMM (NAX) — decode batches.
+// ─────────────────────────────────────────────────────────────────
+
+/// Step token counts the small-M matrix-unit GEMM (`affine_qmm_small_m_*`)
+/// serves on NAX devices. Below, `qmv_fast`'s per-row weight re-reads cost
+/// no more than the matrix unit's padding (base M5, Granite-3.3-2B: 333 vs
+/// 346 µs of GEMM per layer at 3 tokens, 393 vs 343 at 4); above, a second
+/// M tile re-reads the weights and NAX `qmm_t`'s 64-row tile wins (a 32-row
+/// tile loses too).
+pub const SMALL_M_TOKENS: std::ops::RangeInclusive<u32> = 4..=16;
+
+/// Output columns per small-M threadgroup.
+pub const SMALL_M_TILE_COLS: u32 = 16;
+
+/// Simdgroups per small-M threadgroup, each summing its own share of the
+/// K groups: one simdgroup per 16 columns left too few loads in flight
+/// (Granite-3.3-2B's 512-wide k/v at 8 tokens: 23 µs vs 7 µs for
+/// `qmv_fast` at 1). Base M5, Granite-3.3-2B decode TPOT at 4 / 8 / 16
+/// sequences, ms: 1 → 21.5 / 24.5 / 34.2, 2 → 19.4 / 21.2 / 26.2,
+/// 4 → 17.4 / 19.4 / 25.5, 8 → 17.4 / 19.3 / 26.4.
+pub const SMALL_M_SIMDGROUPS: u32 = 4;
+
+/// Rows per small-M threadgroup: the whole batch in the buckets up to 8
+/// tokens, 16 in the larger ones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SmallMTile {
+    Rows8,
+    Rows16,
+}
+
+impl SmallMTile {
+    pub fn rows(self) -> u32 {
+        match self {
+            Self::Rows8 => 8,
+            Self::Rows16 => 16,
+        }
+    }
+
+    /// The tile of a bucket that can see a [`SMALL_M_TOKENS`] step: from the
+    /// range's first count up to the 64-token bucket, the largest that serves
+    /// the range under the default ladder.
+    pub fn for_bucket(bucket_m: u32) -> Option<Self> {
+        match bucket_m {
+            m if m < *SMALL_M_TOKENS.start() || m > 64 => None,
+            ..=8 => Some(Self::Rows8),
+            _ => Some(Self::Rows16),
+        }
+    }
+}
+
+/// `affine_qmm_small_m_<act>_s_<scale>_gs_<gs>_b_4_tm_<rows>_tn_16_nsg_4`
+/// (`quantized_qmm_nax.metal`).
+pub fn small_m_kernel_static_name(
+    dtype: DequantDtype,
+    scale_dtype: ScaleDtype,
+    group_size: u32,
+    tile: SmallMTile,
+) -> &'static str {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Key = (DequantDtype, ScaleDtype, u32, SmallMTile);
+    static CACHE: OnceLock<Mutex<HashMap<Key, &'static str>>> = OnceLock::new();
+    let mut guard = CACHE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("small_m_kernel_static_name cache poisoned");
+    guard
+        .entry((dtype, scale_dtype, group_size, tile))
+        .or_insert_with(|| {
+            Box::leak(
+                format!(
+                    "affine_qmm_small_m_{}_s_{}_gs_{group_size}_b_4_tm_{}_tn_{SMALL_M_TILE_COLS}_nsg_{SMALL_M_SIMDGROUPS}",
+                    dtype.symbol_infix(),
+                    scale_dtype.symbol_infix(),
+                    tile.rows(),
+                )
+                .into_boxed_str(),
+            )
+        })
+}
+
 /// Compute-aware variant. When `compute_dtype != dtype`, picks the
 /// extended `affine_qmm_t_<act>_c_<compute>_s_<scale>_*` symbol. Only
 /// the (Bf16-act, F16-compute) combo is currently instantiated — used
@@ -1167,15 +1249,4 @@ mod tests {
         assert_eq!(get_qmv_batch_limit(4096, 4096, AppleSiliconGen::M2), 10);
         assert_eq!(get_qmv_batch_limit(8192, 8192, AppleSiliconGen::M1), 6);
     }
-}
-
-/// outlier-heavy KV (e.g. Qwen's massive activations) where 3-bit degrades. Read
-/// once at worker init from `SCRATCHY_TQ_BITS`; the lowering bakes the SAME value
-/// into the kernel constants, so they always agree within a run.
-pub fn tq_bits(arch_default: u32) -> u32 {
-    std::env::var("SCRATCHY_TQ_BITS")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .filter(|&b| (2..=8).contains(&b))
-        .unwrap_or(arch_default)
 }

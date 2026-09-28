@@ -21,7 +21,8 @@ use crate::tape::constants::{ConstSlot, ConstantValue};
 use crate::tape::ids::{
     AttnDebugMode, AttnScale, AttnWindow, BlockSize, BlocksPerChunk, BucketM, HeadDim, HiddenSize,
     IntermediateSize, KDim, KDimI32, KPartitionSizeI32, MDimI32, MaxBlocksPerSeq, NDim, NDimI32,
-    NumKvHeads, NumQHeads, QSize, RmsNormEps, RopePairOff, RotDim, SplitK,
+    NumKvHeads, NumQHeads, QSize, RmsNormEps, RopePairOff, RotDim, SplitK, TqCodeBits,
+    TqDecodeHeads,
 };
 
 /// Append the spans rope-on-read function constants (slot 8 = rotary
@@ -259,6 +260,101 @@ impl From<AttentionViaCacheConstants> for Vec<ConstantValue> {
             v.push(ConstantValue::uint(ConstSlot(12), pc));
         }
         v
+    }
+}
+
+/// `KernelId::AttentionViaCacheTq`: the constants its `AttentionViaCache`
+/// twin's set gains — `ATTN_TQ_BITS` (slot 13), which switches the kernel to
+/// reading the TurboQuant packed store, and `ATTN_TQ_K_BIAS` /
+/// `ATTN_TQ_V_BIAS` (slots 14 / 15), set when the codes hold that operand
+/// minus its projection bias (bound at buffers 14 / 15).
+pub struct AttentionViaCacheTqConstants {
+    pub bits: TqCodeBits,
+    pub k_bias: bool,
+    pub v_bias: bool,
+    pub heads: TqDecodeHeads,
+}
+
+impl AttentionViaCacheTqConstants {
+    /// `ATTN_TQ_HEADS`, the slot of [`Self::heads`].
+    pub const HEADS: ConstSlot = ConstSlot(16);
+}
+
+impl From<AttentionViaCacheTqConstants> for Vec<ConstantValue> {
+    fn from(c: AttentionViaCacheTqConstants) -> Self {
+        let mut v = vec![ConstantValue::uint(ConstSlot(13), c.bits.get())];
+        v.extend(c.k_bias.then(|| ConstantValue::uint(ConstSlot(14), 1)));
+        v.extend(c.v_bias.then(|| ConstantValue::uint(ConstSlot(15), 1)));
+        v.push(ConstantValue::uint(
+            AttentionViaCacheTqConstants::HEADS,
+            c.heads.get(),
+        ));
+        v
+    }
+}
+
+/// `KernelId::TqStageRotated` (`tq_stage_rotated_<dtype>`, attention.metal
+/// slots): the layer's KV geometry, the codebook width, and — for K under
+/// rope-on-read — the span re-rope geometry (slots 8/9/10).
+pub struct TqStageConstants {
+    pub head_dim: HeadDim,
+    pub num_kv_heads: NumKvHeads,
+    pub block_size: BlockSize,
+    pub max_blocks: MaxBlocksPerSeq,
+    pub blocks_per_chunk: BlocksPerChunk,
+    pub bits: TqCodeBits,
+    pub rot_dim: Option<RotDim>,
+    pub pair_off: Option<RopePairOff>,
+    pub rope_on_read: Option<u32>,
+    /// `ATTN_TQ_K_BIAS` / `ATTN_TQ_V_BIAS` (slots 14 / 15): the staged
+    /// operand's codes hold it minus its projection bias (bound at buffer 10).
+    pub k_bias: bool,
+    pub v_bias: bool,
+    /// `ATTN_TQ_STAGE_PASS` (slot 17): which rows this dispatch stages.
+    pub pass: TqStagePass,
+}
+
+/// The rows one `tq_stage_rotated` dispatch stages. A step stages its new rows,
+/// then its cached ones: a row new for one sequence can be a prefix-cache hit
+/// for another in the same step, and both rewrite it in place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TqStagePass {
+    /// The step's new rows, read from the cache their writer just filled.
+    New = 1,
+    /// Cached rows, decoded from the packed store.
+    Cached = 2,
+}
+
+impl From<TqStageConstants> for Vec<ConstantValue> {
+    fn from(c: TqStageConstants) -> Self {
+        let mut v = vec![
+            ConstantValue::uint(ConstSlot(0), c.head_dim.get()),
+            ConstantValue::uint(ConstSlot(2), c.num_kv_heads.get()),
+            ConstantValue::uint(ConstSlot(4), c.block_size.get()),
+            ConstantValue::uint(ConstSlot(5), c.max_blocks.get()),
+            ConstantValue::uint(ConstSlot(6), c.blocks_per_chunk.get()),
+        ];
+        push_rope_on_read_consts(&mut v, c.rot_dim, c.pair_off, c.rope_on_read);
+        v.push(ConstantValue::uint(ConstSlot(13), c.bits.get()));
+        v.extend(c.k_bias.then(|| ConstantValue::uint(ConstSlot(14), 1)));
+        v.extend(c.v_bias.then(|| ConstantValue::uint(ConstSlot(15), 1)));
+        v.push(ConstantValue::uint(ConstSlot(17), c.pass as u32));
+        v
+    }
+}
+
+/// `KernelId::TqRotateRows` (`tq_{rotate,unrotate}_rows_<dtype>`).
+pub struct TqRotateRowsConstants {
+    pub head_dim: HeadDim,
+    pub num_q_heads: NumQHeads,
+}
+
+impl From<TqRotateRowsConstants> for Vec<ConstantValue> {
+    fn from(c: TqRotateRowsConstants) -> Self {
+        vec![
+            ConstantValue::uint(ConstSlot(0), c.head_dim.get()),
+            ConstantValue::uint(ConstSlot(1), c.num_q_heads.get()),
+        ]
     }
 }
 

@@ -287,12 +287,6 @@ mod tests {
             ),
             (KernelId::RopeAppend, MetalDtype::F16) => ("rope", "rope_append_f16_specialized"),
             (KernelId::RopeAppend, MetalDtype::Bf16) => ("rope", "rope_append_bf16_specialized"),
-            (KernelId::TqDequantToScratch, MetalDtype::F16) => {
-                ("turboquant", "tq_dequant_blocktable")
-            }
-            (KernelId::TqDequantToScratch, MetalDtype::Bf16) => {
-                ("turboquant", "tq_dequant_blocktable_bf16")
-            }
             (KernelId::TqQuantizeToPacked, MetalDtype::F16) => ("turboquant", "tq_compress_paged"),
             (KernelId::TqQuantizeToPacked, MetalDtype::Bf16) => {
                 ("turboquant", "tq_compress_paged_bf16")
@@ -366,6 +360,7 @@ mod tests {
                 | KernelId::AffineQmmT
                 | KernelId::AffineQmmTSplitK
                 | KernelId::AffineQmmTNax
+                | KernelId::AffineQmmSmallM
                 | KernelId::Nvfp4Qmv
                 | KernelId::Nvfp4QmmT
                 | KernelId::Nvfp4QmmTNax
@@ -385,7 +380,8 @@ mod tests {
             | KernelId::ScalarWeightMul
             | KernelId::NormAddScalarMul
             | KernelId::RopeAppendNormed
-            | KernelId::TqDequantToScratch
+            | KernelId::TqStageRotated
+            | KernelId::TqRotateRows
             | KernelId::TqQuantizeToPacked
             | KernelId::TanhSoftCap
             | KernelId::GatherLastToken
@@ -423,6 +419,7 @@ mod tests {
             | KernelId::AttnCausalSoftmax
             | KernelId::AttnGemmQk
             | KernelId::AttnGemmPv
+            | KernelId::AttentionViaCacheTq
             // BiasAdd specialized pipeline reads `num_cols` from
             // `function_constant(0)`. The test helper's
             // `(kernel, bucket_m)` API can't supply a per-call N;
@@ -527,6 +524,7 @@ mod tests {
             | KernelId::AffineQmmT
             | KernelId::AffineQmmTSplitK
             | KernelId::AffineQmmTNax
+            | KernelId::AffineQmmSmallM
             | KernelId::Nvfp4Qmv
             | KernelId::Nvfp4QmmT
             | KernelId::Nvfp4QmmTNax
@@ -549,7 +547,8 @@ mod tests {
             | KernelId::ScalarWeightMul
             | KernelId::NormAddScalarMul
             | KernelId::RopeAppendNormed
-            | KernelId::TqDequantToScratch
+            | KernelId::TqStageRotated
+            | KernelId::TqRotateRows
             | KernelId::TqQuantizeToPacked
             | KernelId::TanhSoftCap
             | KernelId::GatherLastToken
@@ -583,6 +582,7 @@ mod tests {
             | KernelId::AttnCausalSoftmax
             | KernelId::AttnGemmQk
             | KernelId::AttnGemmPv
+            | KernelId::AttentionViaCacheTq
             | KernelId::BiasAdd => {
                 unreachable!(
                     "constants_for: Affine*/SiluMul/SplitKReduceSum/BiasAdd/Attn* not wired into \
