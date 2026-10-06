@@ -27,13 +27,51 @@ ROOT = HERE.parent
 DATA = HERE / "data" / "metal"
 REPO = "https://github.com/AI-native-Systems-Research/scratchy"
 
-# (key, label, ladder field, scaling field, CSS series class). Fixed order, so
-# an engine keeps its colour whichever engines a run happens to include.
-ENGINES = [
-    ("scratchy", "scratchy", "cache_ladder", "scaling", "s1"),
-    ("mlx-lm", "mlx-lm", "cache_ladder_mlx_lm", "scaling_mlx_lm", "s2"),
-    ("ollama", "ollama", "cache_ladder_ollama", "scaling_ollama", "s3"),
+# Every engine the runner knows, in page order, as (key, label). Its JSON fields
+# are cache_ladder / scaling for scratchy and cache_ladder_<key> / scaling_<key>
+# for the rest; older runs used the same pattern for mlx_lm and ollama alone.
+ENGINE_ORDER = [
+    ("scratchy", "scratchy"),
+    ("omlx_tq", "oMLX TurboQuant"),
+    ("omlx", "oMLX"),
+    ("mlx_lm", "mlx-lm"),
+    ("vllm_metal", "vllm-metal"),
+    ("ollama", "ollama"),
+    ("llama_cpp", "llama.cpp"),
+    ("mistralrs", "mistral.rs"),
 ]
+LABEL = dict(ENGINE_ORDER)
+# The engine a headline comparison uses: the first present. oMLX with TurboQuant
+# meets scratchy's TurboQuant default like for like; then oMLX as installed; then
+# mlx-lm, which runs the same MLX checkpoint; then the rest.
+RIVAL_PREFERENCE = ["omlx_tq", "omlx", "mlx_lm", "vllm_metal", "ollama", "llama_cpp", "mistralrs"]
+
+
+def fields(key):
+    """An engine's (startup ladder, scaling) JSON fields."""
+    return ("cache_ladder", "scaling") if key == "scratchy" else (f"cache_ladder_{key}", f"scaling_{key}")
+
+
+def engines_in(m):
+    """The engines this model entry has numbers for, in page order: (key, label,
+    ladder, scaling cells). scratchy is always first, numbers or not."""
+    out = []
+    for key, label in ENGINE_ORDER:
+        lk, sk = fields(key)
+        if key == "scratchy" or m.get(lk) or m.get(sk):
+            out.append((key, label, m.get(lk), m.get(sk) or []))
+    return out
+
+
+def served_as(m, key):
+    """What an engine served for this model, for its row label: the ollama tag
+    or GGUF file it loaded, with its quantization when it reported one."""
+    e = (m.get("engine_models") or {}).get(key) or {}
+    if not e and key == "ollama" and m.get("ollama"):        # runs before engine_models
+        e = {"model": m["ollama"].get("tag"), "quantization": m["ollama"].get("quantization")}
+    model = (e.get("model") or "").split(":")[-1] if key in ("llama_cpp", "mistralrs") else e.get("model")
+    return ", ".join(x for x in (model if key in ("ollama", "llama_cpp", "mistralrs") else None,
+                                 e.get("quantization")) if x)
 
 REQUIRED = {
     "": ("schema", "generated_utc", "generator", "machine", "repo", "config", "models"),
@@ -279,29 +317,63 @@ def settings(run):
             "KV cache": c.get("kv_cache_dtype") or "default"}
 
 
+def base_of(run, m):
+    """The base shape this model ran at: the run's, with the users-at-once the
+    runner lowered for a model whose KV cache would not fit more."""
+    base = dict((run["config"].get("scaling") or {}).get("base") or {})
+    limits = m.get("scaling_limits") or {}
+    if base and limits.get("base_conc") is not None:
+        base["conc"] = limits["base_conc"]
+    return base
+
+
+def shape(run, m):
+    base = base_of(run, m)
+    return "/".join(str(base.get(k, "?")) for k in ("input", "output", "conc")) if base else "not recorded"
+
+
+def conditions(run, m):
+    """Everything else that can move a run-to-run number besides scratchy's
+    code: the base shape, the other engines' releases, whether the run was
+    pinned, macOS, and the model files. Unrecorded on either side never counts
+    as a change, so runs from before a field existed do not all warn."""
+    files = (m.get("model_files") or {}).get("revision")
+    return {"base shape (in/out/users)": shape(run, m), "engine versions": engine_versions(run),
+            "pinned": pinned(run).split(":")[0], "macOS": run["machine"].get("macos") or "not recorded",
+            "model files": files[:8] if files else "not recorded"}
+
+
 def settings_changed(run, prev):
     """Human-readable differences in settings between two runs, or ""."""
     now, then = settings(run), settings(prev)
     return "; ".join(f"{k} {then[k]} then, {now[k]} now" for k in now if now[k] != then[k])
 
 
+def conditions_changed(run, m, prev):
+    """Like settings_changed, for the conditions around scratchy, or ""."""
+    now, then = conditions(run, m), conditions(prev[0], prev[1])
+    return "; ".join(f"{k} {then[k]} then, {now[k]} now" for k in now
+                     if now[k] != then[k] and "not recorded" not in (now[k], then[k]))
+
+
 def summary_table(m, run, prev=None):
-    base = (run["config"].get("scaling") or {}).get("base") or {}
+    base = base_of(run, m)
     shape = f"{base.get('input', '?')} in / {base.get('output', '?')} out" if base else ""
     rows = []
-    for key, label, lk, sk, cls in ENGINES:
-        ladder, one = m.get(lk), cell(m.get(sk), "conc", 1)
+    for key, label, ladder, cells in engines_in(m):
+        one = cell(cells, "conc", 1)
+        cls = "s1" if key == "scratchy" else "s0"
         if key == "scratchy" and not served(m):
-            why = "build failed" if not m.get("built") else "the server never served"
+            why = ("build failed" if not m.get("built")
+                   else "its answers did not match mlx-lm's, so no engine was timed"
+                   if m.get("parity_mlx_lm") is False else "the server never served")
             rows.append(f'<tr><th scope="row"><span class="key {cls}"></span>{label}</th>'
                         f'<td colspan="8" class="gap">No numbers: {why}. See the run\'s raw logs.</td></tr>')
             continue
-        if key != "scratchy" and not (ladder or m.get(sk)):
-            continue                      # that engine was not part of this run
-        name = label
-        if key == "ollama" and m.get("ollama"):
-            o = m["ollama"]
-            name += f' <span class="dim">{esc(o.get("tag", ""))}{", " + esc(o["quantization"]) if o.get("quantization") else ""}</span>'
+        name = esc(label)
+        detail = served_as(m, key)
+        if detail:
+            name += f' <span class="dim">{esc(detail)}</span>'
         vals = [
             lfmt(ladder, "frozen", "t_ready_s", 2),
             lfmt(ladder, "cold", "t_ready_s", 2),
@@ -314,6 +386,7 @@ def summary_table(m, run, prev=None):
         ]
         badges = [""] * len(vals)
         if key == "scratchy" and prev is not None:
+            lk, sk = fields("scratchy")
             badges = [delta(n, o, hb) for n, o, hb in
                       zip(summary_raw(m, lk, sk), summary_raw(prev[1], lk, sk), SUMMARY_HIGHER_BETTER)]
         rows.append(f'<tr><th scope="row"><span class="key {cls}"></span>{name}</th>'
@@ -326,6 +399,9 @@ def summary_table(m, run, prev=None):
         if changed:
             vs += (f' <b>Settings differ from that run</b> ({esc(changed)}), so a change is not '
                    'the code alone.')
+        around = conditions_changed(run, m, prev)
+        if around:
+            vs += f' <b>Also different</b>: {esc(around)}.'
     return f"""<div class="mpart">
   <h4>Startup and single-user speed</h4>
   <p class="msub">One row per engine. Startup in seconds (warm in ms); one user at {shape or 'the base shape'}.{vs}
@@ -348,12 +424,14 @@ def summary_table(m, run, prev=None):
 </div>"""
 
 
-def line_svg(series, xs, cid, ylabel, nd, title, head, notes=None):
-    """One line chart: offered users on x, one line per engine. A point that
-    was not measured (None) leaves a gap in its line rather than a bridge.
-    `notes` maps (engine label, x) to a suffix for that point's tooltip."""
+def line_svg(series, xs, cid, ylabel, nd, title, head, xlabel, notes=None):
+    """One small line chart, the unit of every small multiple: x is the axis
+    being swept (users, or prompt tokens), one line per series. A point that was
+    not measured (None) leaves a gap in its line rather than a bridge. Its
+    legend sits above it, so it carries no end labels and stays narrow.
+    `notes` maps (series label, x) to a suffix for that point's tooltip."""
     notes = notes or {}
-    W, H, L, R, T, B = 400, 230, 46, 72, 12, 38
+    W, H, L, R, T, B = 300, 190, 44, 14, 10, 36
     pw, ph = W - L - R, H - T - B
     vals = [v for _, _, pts in series for _, v in pts if v is not None]
     ymax = nice_max(max(vals))
@@ -362,20 +440,22 @@ def line_svg(series, xs, cid, ylabel, nd, title, head, notes=None):
     def ypos(v):
         return T + ph - ph * v / ymax
 
+    def short(x):                         # 131072 -> 128k, so long prompt lengths fit
+        return f"{x // 1024}k" if x >= 8192 and x % 1024 == 0 else f"{x:,}"
+
     out = [f'<svg viewBox="0 0 {W} {H}" class="mchart" role="img" '
            f'aria-labelledby="{cid}-t"><title id="{cid}-t">{esc(title)}</title>']
-    for i in range(6):
-        v = ymax * i / 5
+    for i in range(5):
+        v = ymax * i / 4
         y = ypos(v)
         out.append(f'<line class="grid" x1="{L}" x2="{L + pw}" y1="{y:.1f}" y2="{y:.1f}"/>'
-                   f'<text class="tick" x="{L - 8}" y="{y + 4:.1f}" text-anchor="end">{v:,.0f}</text>')
+                   f'<text class="tick" x="{L - 6}" y="{y + 4:.1f}" text-anchor="end">{v:,.0f}</text>')
     for x in xs:
-        out.append(f'<text class="tick" x="{xpos[x]:.1f}" y="{T + ph + 18}" text-anchor="middle">{x}</text>')
-    out.append(f'<text class="axis" x="{L + pw / 2:.1f}" y="{H - 4}" text-anchor="middle">offered concurrent users</text>')
-    out.append(f'<text class="axis" x="12" y="{T + ph / 2:.1f}" text-anchor="middle" '
-               f'transform="rotate(-90 12 {T + ph / 2:.1f})">{esc(ylabel)}</text>')
+        out.append(f'<text class="tick" x="{xpos[x]:.1f}" y="{T + ph + 16}" text-anchor="middle">{short(x)}</text>')
+    out.append(f'<text class="axis" x="{L + pw / 2:.1f}" y="{H - 3}" text-anchor="middle">{esc(xlabel)}</text>')
+    out.append(f'<text class="axis" x="11" y="{T + ph / 2:.1f}" text-anchor="middle" '
+               f'transform="rotate(-90 11 {T + ph / 2:.1f})">{esc(ylabel)}</text>')
     out.append(f'<line class="xhair" x1="0" x2="0" y1="{T}" y2="{T + ph}" style="display:none"/>')
-    ends = []
     for label, cls, pts in series:
         d, pen = [], "M"
         for x, v in pts:
@@ -387,23 +467,8 @@ def line_svg(series, xs, cid, ylabel, nd, title, head, notes=None):
         out.append(f'<path class="ln {cls}" d="{" ".join(d)}"/>')
         out += [f'<circle class="dot {cls}" cx="{xpos[x]:.1f}" cy="{ypos(v):.1f}" r="4"/>'
                 for x, v in pts if v is not None]
-        last = [(x, v) for x, v in pts if v is not None]
-        if last:
-            x, v = last[-1]
-            ends.append([ypos(v), xpos[x], label, cls])
-    # End labels in text ink beside their line; pushed apart where lines
-    # converge, with a leader back to the line end so none detaches.
-    ends.sort()
-    prev = None
-    for end in ends:
-        prev = end[0] if prev is None else max(end[0], prev + 14)
-        end.append(prev)
-    for y, x, label, cls, ly in ends:
-        if abs(ly - y) > 1:
-            out.append(f'<line class="leader" x1="{x + 6:.1f}" y1="{y:.1f}" x2="{x + 12:.1f}" y2="{ly:.1f}"/>')
-        out.append(f'<text class="endlbl" x="{x + 14:.1f}" y="{ly + 4:.1f}">{esc(label)}</text>')
     # One hit band per x, wider than any mark: the crosshair finds the x and
-    # the tooltip lists every engine there.
+    # the tooltip lists every series there.
     by_x = [(label, cls, dict(pts)) for label, cls, pts in series]
     for i, x in enumerate(xs):
         left = (xpos[xs[i - 1]] + xpos[x]) / 2 if i else L
@@ -415,82 +480,98 @@ def line_svg(series, xs, cid, ylabel, nd, title, head, notes=None):
             note = notes.get((label, x))
             rows.append([value + (PARTIAL if note else ""), label + (f" ({note})" if note else ""), cls])
         out.append(f'<rect class="hit" x="{left:.1f}" y="{T}" width="{right - left:.1f}" height="{ph}" '
-                   f'tabindex="0" data-x="{xpos[x]:.1f}" data-head="{x} offered users · {esc(head)}" '
-                   f'data-tip="{tip(rows)}"><title>{x} users</title></rect>')
+                   f'tabindex="0" data-x="{xpos[x]:.1f}" data-head="{short(x)} {esc(head)}" '
+                   f'data-tip="{tip(rows)}"><title>{short(x)}</title></rect>')
     out.append("</svg>")
     return "".join(out)
 
 
-def conc_chart(m, mid, base, run, prev=None):
-    """Throughput and time per output token against offered users, side by
-    side: two measures, so two charts on one x axis rather than two y axes."""
-    cells = {key: {c["rung"]: c for c in m.get(sk) or [] if c.get("axis") == "conc"}
-             for key, _l, _lk, sk, _c in ENGINES}
-    xs = sorted({x for cs in cells.values() for x in cs})
-    if not xs:
-        return ""
+# The two sweeps a model gets small multiples for: (axis, section title, x-axis
+# label, tooltip unit, caption, the metrics as (metric, title, unit note, y label,
+# digits)). Two measures each, so two rows of charts rather than two y axes.
+SWEEPS = {
+    "conc": ("As users are added", "offered users", "users",
+             "A rising line in the lower row means each user's answer slows down as more share the engine.",
+             [("output_throughput", "Throughput", "tok/s, higher is better", "tok/s", 1),
+              ("median_tpot_ms", "Time per output token", "ms, lower is better", "ms", 1)]),
+    "input": ("As prompts get longer", "prompt tokens", "token prompt",
+              "Memory is the whole server's footprint at its peak during the cell, Metal buffers "
+              "included; scratchy reserves its KV cache up front, so its line starts high and stays flat.",
+              [("median_ttft_ms", "Time to first token", "ms, lower is better", "ms", 0),
+               ("server_mem_peak_mib", "Server memory", "MiB, peak", "MiB", 0)]),
+}
 
-    # The previous run's scratchy line, drawn first so it sits behind.
-    pcs = {c["rung"]: c for c in (prev[1].get("scaling") if prev else None) or [] if c.get("axis") == "conc"}
+
+def sweep_charts(m, mid, axis, base, run, prev=None):
+    """One small multiple per comparison engine, scratchy against it alone: two
+    colours per chart however many engines ran. The previous run's scratchy line
+    sits behind in grey."""
+    title, xlabel, head, caption, metrics = SWEEPS[axis]
+    engines = [(k, lab, {c["rung"]: c for c in cells if c.get("axis") == axis})
+               for k, lab, _l, cells in engines_in(m)]
+    engines = [e for e in engines if e[2]]
+    if not engines or engines[0][0] != "scratchy":
+        return ""
+    mine = engines[0][2]
+    rivals = engines[1:] or [(None, None, {})]
+    xs = sorted({x for _k, _l, cs in engines for x in cs})
+    pcs = {c["rung"]: c for c in (prev[1].get("scaling") if prev else None) or [] if c.get("axis") == axis}
     plabel = ""
-    if prev:
-        plabel = f"previous ({prev[0]['generated_utc'][5:10]}" + (
+    if prev and pcs:
+        plabel = f"scratchy, previous ({prev[0]['generated_utc'][5:10]}" + (
             ", different settings)" if settings_changed(run, prev[0]) else ")")
 
-    def series(metric):
-        out = []
-        if pcs:
-            out.append((plabel, "prev", [(x, timing(pcs[x], metric)) for x in xs if x in pcs]))
-        for key, label, _lk, _sk, cls in ENGINES:
-            cs = cells[key]
-            if cs:
-                out.append((label, cls, [(x, timing(cs[x], metric)) for x in xs if x in cs]))
-        return [s for s in out if any(v is not None for _, v in s[2])]
+    def pts(cs, metric):
+        return [(x, timing(cs[x], metric)) for x in xs if x in cs]
 
-    tput, tpot = series("output_throughput"), series("median_tpot_ms")
-    charts = []
-    if tput:
-        charts.append(("Throughput", "tok/s, higher is better",
-                       line_svg(tput, xs, f"{mid}-tput", "tok/s", 1,
-                                "Output tokens per second against offered concurrent users, per engine", "tok/s"), ""))
-    if tpot:
-        # An engine that never streamed has no TPOT; say so rather than let
-        # its line silently vanish from this chart.
-        plotted = {label for label, _, _ in tpot}
-        gone = [label for label, cls, _ in tput if cls != "prev" and label not in plotted]
-        note = f'<p class="msub">{esc(", ".join(gone))}: {NO_STREAM}, not plotted.</p>' if gone else ""
-        marks = {(label, x): untimed_note(cells[key][x])
-                 for key, label, _lk, _sk, _c in ENGINES for x in cells[key]
-                 if partial(cells[key][x], "median_tpot_ms")}
-        charts.append(("Time per output token", "ms, lower is better",
-                       line_svg(tpot, xs, f"{mid}-tpot", "ms", 1,
-                                "Median time per output token against offered concurrent users, per engine", "TPOT ms",
-                                marks), note))
-    shown = {label for label, _, _ in tput + tpot}
-    engines = [(label, cls) for _k, label, _lk, _sk, cls in ENGINES if label in shown]
-    if plabel in shown:
-        engines.append((f"scratchy, {plabel}", "prev"))
-    # One engine needs no legend: its end label and the caption already name it.
-    legend = "".join(f'<span><span class="lkey {cls}"></span>{esc(label)}</span>'
-                     for label, cls in engines) if len(engines) > 1 else ""
-    head = "".join(f"<th scope=\"col\">{x}</th>" for x in xs)
+    rows = []
+    for metric, mtitle, unit, ylabel, nd in metrics:
+        panes = []
+        for key, label, theirs in rivals:
+            series = []
+            if pcs:
+                series.append((plabel, "prev", pts(pcs, metric)))
+            series.append(("scratchy", "s1", pts(mine, metric)))
+            if key:
+                series.append((label, "s2", pts(theirs, metric)))
+            series = [x for x in series if any(v is not None for _, v in x[2])]
+            if not any(lbl == "scratchy" for lbl, _c, _p in series):
+                continue
+            marks = {(lab, x): untimed_note(cs[x]) for lab, cs in (("scratchy", mine), (label, theirs))
+                     if lab for x in cs if partial(cs[x], metric)}
+            gone = key and label not in {lbl for lbl, _c, _p in series}
+            name = (f"vs {esc(label)}" + (f' <span class="dim">({NO_STREAM})</span>' if gone else "")
+                    if key else "scratchy")
+            svg = line_svg(series, xs, f"{mid}-{axis}-{metric}-{key or 'self'}", ylabel, nd,
+                           f"{mtitle} against {xlabel}, scratchy and {label or 'nothing else'}",
+                           f"{head} · {mtitle}", xlabel, marks)
+            panes.append(f'<div class="chartpane mini"><div class="minititle">{name}</div>{svg}</div>')
+        if panes:
+            # One legend per row: the same two or three lines in every chart.
+            keys = [("s1", "scratchy")] + ([("s2", "the engine named above each chart")] if rivals[0][0] else [])
+            if pcs:
+                keys.append(("prev", plabel))
+            legend = "".join(f'<span><span class="lkey {c}"></span>{esc(t)}</span>' for c, t in keys)
+            rows.append(f'<div class="heatttl"><b>{esc(mtitle)}</b> <span class="dim">({esc(unit)})</span></div>'
+                        f'<div class="legend">{legend}</div><div class="chartrow">{"".join(panes)}</div>')
+    if not rows:
+        return ""
+    # The table view: every engine, every metric, every x.
+    head_row = "".join(f'<th scope="col">{x:,}</th>' for x in xs)
     trs = []
-    for key, label, _lk, _sk, cls in ENGINES:
-        cs = cells[key]
-        if not cs:
-            continue
-        for metric, nd, name in (("output_throughput", 1, "tok/s"), ("median_ttft_ms", 0, "TTFT ms"),
-                                 ("median_tpot_ms", 1, "TPOT ms")):
-            trs.append(f'<tr><th scope="row">{esc(label)} · {name}</th>'
+    for _key, label, cs in engines:
+        for metric, mtitle, _u, ylabel, nd in metrics + ([("median_ttft_ms", "TTFT", "", "ms", 0)] if axis == "conc" else []):
+            trs.append(f'<tr><th scope="row">{esc(label)} · {esc(mtitle)} {esc(ylabel)}</th>'
                        + "".join(f"<td>{cfmt(cs.get(x), metric, nd)}</td>" for x in xs) + "</tr>")
-    panes = "".join(f'<div class="chartpane"><div class="heatttl">{esc(t)} <span class="dim">({esc(u)})</span></div>{svg}{note}</div>'
-                    for t, u, svg, note in charts)
+    shape = (f"{', '.join(map(str, xs[:-1]))} and {xs[-1]} users at once {USERS_INFO}; "
+             f"{esc(base.get('input', '?'))}-token prompts, {esc(base.get('output', '?'))}-token answers"
+             if axis == "conc" else
+             f"{esc(base.get('conc', '?'))} users at once, {esc(base.get('output', '?'))}-token answers")
     return f"""<figure class="mfig">
-  <figcaption><h4>As users are added</h4>
-    <p class="msub">Throughput and time per output token with {esc(", ".join(map(str, xs[:-1])) + " and " + str(xs[-1]) if len(xs) > 1 else xs[0])} users at once {USERS_INFO}; {esc(base.get("input", "?"))}-token prompts, {esc(base.get("output", "?"))}-token answers. A line that rises in the right-hand chart means each user's answer slows down as more share the engine.</p></figcaption>
-  <div class="legend">{legend}</div>
-  <div class="chartrow">{panes}</div>
-  {fold("Table view", f'<div class="mtable"><table><thead><tr><th scope="col">offered users</th>{head}</tr></thead><tbody>{"".join(trs)}</tbody></table></div>')}
+  <figcaption><h4>{esc(title)}</h4>
+    <p class="msub">{shape}. One small chart per engine: scratchy in blue against that engine in orange. {esc(caption)}</p></figcaption>
+  {"".join(rows)}
+  {fold("Table view", f'<div class="mtable"><table><thead><tr><th scope="col">{esc(xlabel)}</th>{head_row}</tr></thead><tbody>{"".join(trs)}</tbody></table></div>')}
 </figure>"""
 
 
@@ -531,84 +612,67 @@ GRID_METRICS = [("output_throughput", "throughput", faster_tput),
 
 
 def grid_setup(m, run):
-    """A model's prompt-by-answer grid: (inputs, outputs, cells per engine,
-    rival, other), or None when scratchy has no grid. The rival is mlx-lm,
-    which runs the same MLX checkpoint; failing that ollama; None with neither."""
+    """A model's prompt-by-answer grid: (inputs, outputs, cells per engine key,
+    the comparison engines in page order, the headline one), or None when
+    scratchy has no grid. The headline engine follows RIVAL_PREFERENCE."""
     sc = run["config"].get("scaling") or {}
     ins, outs = sc.get("grid_input") or [], sc.get("grid_output") or []
-    have = {e[0]: {c["rung"]: c for c in m.get(e[3]) or [] if c.get("axis") == "grid"} for e in ENGINES}
-    if not have["scratchy"] or not ins or not outs:
+    have = {k: {c["rung"]: c for c in cells if c.get("axis") == "grid"} for k, _l, _ld, cells in engines_in(m)}
+    have = {k: v for k, v in have.items() if v}
+    if not have.get("scratchy") or not ins or not outs:
         return None
-    present = [k for k in ("mlx-lm", "ollama") if have[k]]
-    return ins, outs, have, (present[0] if present else None), (present[1] if len(present) > 1 else None)
+    rivals = [k for k, _l in ENGINE_ORDER if k != "scratchy" and k in have]
+    headline = next((k for k in RIVAL_PREFERENCE if k in have), None)
+    return ins, outs, have, rivals, headline
 
 
 def grid_maps(m, run):
+    """The prompt-by-answer grid, dense: per metric one table, scratchy's own
+    values on top, then one row per engine with each cell coloured by how many
+    times faster scratchy is than it. Every engine in one view, no picker."""
     setup = grid_setup(m, run)
     if setup is None:
         return ""
-    ins, outs, have, rival, other = setup
-    conc = ((run["config"].get("scaling") or {}).get("base") or {}).get("conc", "?")
+    ins, outs, have, rivals, _headline = setup
+    conc = base_of(run, m).get("conc", "?")
 
-    def why(c, name):
-        return f"{name}: {NO_STREAM}" if c else f"no {name}"
-
-    def one(metric, title, faster):
-        def mark(*cells):
-            return PARTIAL if any(partial(c, metric) for c in cells) else ""
-
-        rows = []
-        for i in ins:
+    def table(metric, title, faster):
+        nd = 1 if metric == "output_throughput" else 0
+        unit = "tok/s" if metric == "output_throughput" else "ms"
+        groups = "".join(f'<th scope="colgroup" colspan="{len(outs)}" class="grp">{i:,}-token prompt</th>' for i in ins)
+        heads = "".join(f'<th scope="col" class="{"grp0" if j == 0 else ""}">{o}</th>' for _ in ins for j, o in enumerate(outs))
+        mine = have["scratchy"]
+        trs = ['<tr><th scope="row">scratchy <span class="dim">' + unit + '</span></th>'
+               + "".join(f'<td class="own{" grp0" if j == 0 else ""}">{cfmt(mine.get(f"{i}x{o}"), metric, nd)}</td>'
+                         for i in ins for j, o in enumerate(outs)) + "</tr>"]
+        for k in rivals:
             tds = []
-            for o in outs:
-                rung = f"{i}x{o}"
-                cs = have["scratchy"].get(rung)
-                cr = have[rival].get(rung) if rival else None
-                co = have[other].get(rung) if other else None
-                s, vr, vo = timing(cs, metric), timing(cr, metric), timing(co, metric)
-                r_r, r_o = faster(s, vr), faster(s, vo)
-                nd = 1 if metric == "output_throughput" else 0
-                tiprows = [[cfmt(have[k].get(rung), metric, nd),
-                            k + (f" ({untimed_note(have[k][rung])})" if partial(have[k].get(rung), metric) else ""), cls]
-                           for k, _l, _lk, _sk, cls in ENGINES if have[k]]
-                unit = "tok/s" if metric == "output_throughput" else "ms"
-                if rival is None:                 # nothing to compare against
-                    big, small = cfmt(cs, metric, nd), unit if s is not None else ""
-                else:
-                    big = (f"×{r_r:.2f}{mark(cs, cr)}" if r_r is not None
-                           else why(cs, "scratchy") if s is None else why(cr, rival))
-                    small = (f"vs {other} ×{r_o:.2f}{mark(cs, co)}" if r_o is not None
-                             else "" if s is None or not other else why(co, other))
-                tds.append(f'<td class="{heat_class(r_r)}" tabindex="0" data-head="{i} in × {o} out · {esc(title)}" '
-                           f'data-tip="{tip(tiprows)}"><b>{big}</b><span>{small}</span></td>')
-            rows.append(f'<tr><th scope="row">{i}</th>{"".join(tds)}</tr>')
-        head = "".join(f'<th scope="col">{o}</th>' for o in outs)
-        versus = f" · scratchy vs {rival}" if rival else " · scratchy"
-        return f"""<div class="heat">
-    <div class="heatttl"><b>{esc(title)}</b>{esc(versus)}</div>
-    <div class="mtable"><table><thead><tr><th scope="col"><span class="dim">prompt ↓ / answer →</span></th>{head}</tr></thead>
-    <tbody>{''.join(rows)}</tbody></table></div>
+            for i in ins:
+                for j, o in enumerate(outs):
+                    rung = f"{i}x{o}"
+                    cs, cr = mine.get(rung), have[k].get(rung)
+                    r = faster(timing(cs, metric), timing(cr, metric))
+                    mark = PARTIAL if partial(cs, metric) or partial(cr, metric) else ""
+                    text = (f"{r:.2f}{mark}" if r is not None
+                            else NO_STREAM if cr and timing(cr, metric) is None else "—")
+                    rows = [[cfmt(cs, metric, nd), "scratchy", "s1"], [cfmt(cr, metric, nd), LABEL[k], "s2"]]
+                    tds.append(f'<td class="{heat_class(r)}{" grp0" if j == 0 else ""}" tabindex="0" '
+                               f'data-head="{i} in × {o} out · {esc(title)}" data-tip="{tip(rows)}">{text}</td>')
+            trs.append(f'<tr><th scope="row">vs {esc(LABEL[k])}</th>{"".join(tds)}</tr>')
+        return f"""<div class="heat dheat">
+    <div class="heatttl"><b>{esc(title)}</b></div>
+    <div class="mtable"><table><thead><tr><th scope="col" rowspan="2"><span class="dim">answer tokens →</span></th>{groups}</tr>
+    <tr>{heads}</tr></thead><tbody>{"".join(trs)}</tbody></table></div>
   </div>"""
 
-    if rival is None:
-        note = "scratchy's own values; this run has no mlx-lm or ollama to compare against"
-        scale = ""
-    else:
-        missing = [k for k in ("mlx-lm", "ollama") if not have[k]]
-        note = (f"prompt size down the side, answer size across the top. Each large number "
-                f"is how many times faster scratchy is than {rival}"
-                + (f" (this run has no {missing[0]})" if missing else "")
-                + ": ×1.20 is 20% faster, below ×1 is slower"
-                + (f"; the small line is the same against {other}" if other else "")
-                + ". Hover for every engine's value")
-        scale = (f'<div class="scale"><span class="scalekey">Colour and large number, scratchy vs {esc(rival)}:</span>'
-                 f'{heat_legend()}</div>')
+    note = (f"{esc(conc)} users at once. Top row: scratchy's own values. Each row below: how many times "
+            "faster scratchy is than that engine, ×1.20 is 20% faster, below 1 is slower. Hover for both values."
+            if rivals else f"{esc(conc)} users at once; scratchy's own values, with no other engine to compare against.")
+    scale = (f'<div class="scale"><span class="scalekey">scratchy is:</span>{heat_legend()}</div>' if rivals else "")
     return f"""<figure class="mfig">
   <figcaption><h4>Prompt size × answer size</h4>
-    <p class="msub">{esc(conc)} users at once; {esc(note)}.</p></figcaption>
-  <div class="heatrow">
-  {"".join(one(metric, title, faster) for metric, title, faster in GRID_METRICS)}
-  </div>
+    <p class="msub">{note}</p></figcaption>
+  {"".join(table(metric, title, faster) for metric, title, faster in GRID_METRICS)}
   {scale}
 </figure>"""
 
@@ -641,6 +705,44 @@ def history(entries):
   <tbody>{''.join(rows)}</tbody></table></div>""")
 
 
+def engine_versions(run):
+    """The comparison engines' releases as the runner recorded them: every
+    engine from config.engines, else the mlx-lm/ollama pair older runs kept."""
+    c = run["config"]
+    if c.get("engines"):
+        parts = [f"{e['label']} {e['version']}" for e in c["engines"]
+                 if e.get("key") != "scratchy" and e.get("installed") and e.get("version")]
+    else:
+        v = c.get("engine_versions") or {}
+        parts = [f"{LABEL.get(k, k)} {v[k]}" for k in ("mlx_lm", "ollama") if v.get(k)]
+    return " · ".join(parts) or "not recorded"
+
+
+def pinned(run):
+    """Whether the run was an agreed, fully pinned one (runs before pins: not recorded)."""
+    c = run["config"]
+    if "pinned" not in c:
+        return "not recorded"
+    return "yes" if c["pinned"] else "no: " + "; ".join(c.get("pin_problems") or [])
+
+
+def parity(m):
+    """The parity gate's verdict for the model line: scratchy and mlx-lm must
+    give the same greedy answers before anything is timed. Runs from before
+    the gate say nothing."""
+    if "parity_mlx_lm" not in m:
+        return ""
+    verdict = {True: "matches mlx-lm", False: "does not match mlx-lm"}.get(m["parity_mlx_lm"],
+                                                                          "not checked (no mlx-lm)")
+    return " · output " + esc(verdict) + " " + PARITY_INFO
+
+
+PARITY_INFO = info(
+    "Before anything is timed, scratchy and mlx-lm answer the same short prompts with greedy "
+    "decoding, and the answers must match exactly. A mismatch points at a wrong load path "
+    "(quant preset, group size, dequant), so that model is not timed at all.")
+
+
 def runs_table(runs):
     rows = []
     for run in reversed(runs):
@@ -654,16 +756,28 @@ def runs_table(runs):
             f'<td>{esc(prime) if prime is not None else "not recorded"}</td>'
             f'<td>{esc(settings(run)["KV cache"])}</td>'
             f'<td><code>{esc(settings(run)["serve flags"])}</code></td>'
+            f'<td>{esc(engine_versions(run))}</td>'
+            f'<td>{esc(pinned(run))}</td>'
             f'<td><a href="data/metal/{esc(run["_file"].name)}">json</a></td></tr>')
     return fold(f"Runs on this machine ({len(runs)})", f"""<div class="mtable"><table>
   <thead><tr><th scope="col">when</th><th scope="col">scratchy</th><th scope="col">steps</th>
-  <th scope="col">cold priming launches</th><th scope="col">scratchy KV cache</th><th scope="col">scratchy serve flags</th><th scope="col">data</th></tr></thead>
+  <th scope="col">cold priming launches</th><th scope="col">scratchy KV cache</th><th scope="col">scratchy serve flags</th><th scope="col">engine versions</th><th scope="col">pinned</th><th scope="col">data</th></tr></thead>
   <tbody>{''.join(rows)}</tbody></table></div>""")
 
 
+def current_models(run):
+    """The models the runner measured as current when this run was made: its
+    full set (current_models), or the default list the first runs to record
+    one kept; none for runs older than that."""
+    return run["config"].get("current_models") or run["config"].get("default_models")
+
+
 def index(runs):
-    """Per machine, oldest run first: (runs, newest entry per model, every
-    entry per model). Newer runs win, so a model shows its newest numbers."""
+    """Per machine, oldest run first: (runs, newest entry per current model,
+    every entry per model). Newer runs win, so a model shows its newest numbers.
+    A model is retired once the newest run that recorded the runner's current
+    models leaves it out and ran it no later, so a --models subset hides
+    nothing; runs before that record keep every model current."""
     machines = {}
     for run in sorted(runs, key=lambda r: r["generated_utc"]):
         rs, latest, seen = machines.setdefault(run["machine"]["chip"], ([], {}, {}))
@@ -671,6 +785,13 @@ def index(runs):
         for m in run["models"]:
             latest[m["stem"]] = (run, m)
             seen.setdefault(m["stem"], []).append((run, m))
+    for rs, latest, _seen in machines.values():
+        ref = next((r for r in reversed(rs) if current_models(r)), None)
+        if ref:
+            keep = set(current_models(ref))
+            for stem in [s for s, (r, _m) in latest.items()
+                         if s not in keep and r["generated_utc"] <= ref["generated_utc"]]:
+                del latest[stem]
     return dict(sorted(machines.items()))
 
 
@@ -692,7 +813,7 @@ def glance(machines):
         setup = grid_setup(m, run)
         if setup is None:
             return '<td class="gnone">no grid</td>'
-        ins, outs, have, rival, _other = setup
+        ins, outs, have, _rivals, rival = setup
         if rival is None:
             return '<td class="gnone">nothing to compare</td>'
         squares, ratios = [], []
@@ -708,12 +829,12 @@ def glance(machines):
                 # A square with nothing to compare is hollow, so it never reads
                 # as "about the same".
                 squares.append(f'<span class="gsq {heat_class(r) or "gnil"}" data-head="{esc(chip)} · {esc(stem)} · {i} in × {o} out" '
-                               f'data-tip="{tip([[value, "vs " + rival, "s1"]])}"></span>')
+                               f'data-tip="{tip([[value, "vs " + LABEL[rival], "s1"]])}"></span>')
         span = f"×{min(ratios):.2f} to ×{max(ratios):.2f}" if ratios else "no ratios"
         return (f'<td><a class="gmini" href="#{slug(chip)}-{slug(stem)}" '
-                f'aria-label="{esc(stem)} on {esc(chip)}: scratchy {span} against {rival}; open the full grid" '
+                f'aria-label="{esc(stem)} on {esc(chip)}: scratchy {span} against {esc(LABEL[rival])}; open the full grid" '
                 f'style="grid-template-columns: repeat({len(outs)}, 1fr)">{"".join(squares)}</a>'
-                f'<span class="grange">{span} vs {esc(rival)}</span></td>')
+                f'<span class="grange">{span} vs {esc(LABEL[rival])}</span></td>')
 
     tables = []
     for metric, title, faster in GRID_METRICS:
@@ -728,8 +849,9 @@ def glance(machines):
   <h2>At a glance</h2>
   <p class="msub">Every model's prompt size × answer size grid on every machine. Each square is
   one cell of the full grid (rows: prompt, short to long; columns: answer, short to long),
-  coloured by how many times faster scratchy is than mlx-lm (ollama where a run has no mlx-lm).
-  Hover a square for its ratio; click a grid for its model.</p>
+  coloured by how many times faster scratchy is than one engine: oMLX with TurboQuant where the
+  run has it (TurboQuant against TurboQuant), else oMLX, else mlx-lm; each grid names its engine.
+  Hover a square for its ratio; click a grid for every engine.</p>
   <div class="heatrow">{''.join(tables)}</div>
   <div class="scale"><span class="scalekey">scratchy is:</span>{heat_legend()}<span><i class="sw nil"></i>no comparison</span></div>
 </section>"""
@@ -745,6 +867,11 @@ def machine_section(chip, runs, latest, seen):
   <h2>{esc(chip)}</h2>
   <p class="mmeta">{cores} · {esc(mc["memory_gb"])} GB unified memory · macOS {esc(mc["macos"])}</p>
   {runs_table(runs)}"""]
+    skipped = [x for x in runs[-1].get("skipped_models") or [] if x.get("stem") not in latest]
+    if skipped:
+        parts.append('  <p class="msub">Not run on this machine: '
+                     + "; ".join(f'{esc(x["stem"])} ({esc(x.get("reason") or "skipped")})' for x in skipped)
+                     + ".</p>")
     for stem, (run, m) in latest.items():
         # Before/after: the newest earlier run of this model, here, that scratchy served.
         prev = next(((r, pm) for r, pm in reversed(seen[stem][:-1]) if served(pm)), None)
@@ -755,15 +882,19 @@ def machine_section(chip, runs, latest, seen):
             build = f' · scratchy build {esc(f["build_seconds"])} s'
             if f.get("binary_bytes"):
                 build += f', {round(f["binary_bytes"] / 1048576)} MiB binary'
-        base = (run["config"].get("scaling") or {}).get("base") or {}
+        rev = (m.get("model_files") or {}).get("revision")
+        files = (f' · files <a href="https://huggingface.co/{esc(m["model_id"])}/tree/{esc(rev)}">'
+                 f'<code>{esc(rev[:8])}</code></a>') if rev else ""
+        base = base_of(run, m)
         parts.append(f"""  <article class="mmodel cds--tile" id="{mid}">
     <h3>{esc(stem)} <span class="onmachine">on {esc(chip)}</span></h3>
     <p class="mmeta"><a href="https://huggingface.co/{esc(m["model_id"])}">{esc(m["model_id"])}</a>
-      · {esc(m.get("quant") or "default")}{build}
+      · {esc(m.get("quant") or "default")}{files}{build}{parity(m)}
       · run {esc(run["generated_utc"][:10])}, <code>{esc(str(run["repo"]["sha"])[:8])}</code></p>
     {summary_table(m, run, prev)}
-    {conc_chart(m, mid, base, run, prev)}
+    {sweep_charts(m, mid, "conc", base, run, prev)}
     {grid_maps(m, run)}
+    {sweep_charts(m, mid, "input", base, run, prev)}
     {history(seen[stem])}
   </article>""")
     parts.append("</section>")
@@ -811,8 +942,10 @@ def main():
 
 ABOUT = info(
     "Prompts are made up, a fixed size, and unique per request so no cache can answer "
-    "them, with greedy decoding (temperature 0) on every engine. mlx-lm runs the same MLX "
-    "checkpoint as scratchy; ollama runs its own GGUF quantization, named on its row. "
+    "them, with greedy decoding (temperature 0) on every engine. oMLX, mlx-lm and "
+    "vllm-metal run the same MLX checkpoint as scratchy; ollama runs its MLX engine; "
+    "llama.cpp and mistral.rs run the same Q4_K_M GGUF, named on its row. oMLX runs twice: "
+    "as installed (FP16 KV) and with its TurboQuant KV, like scratchy's default. "
     "scratchy's build time is shown per model and is never part of startup. The (i) "
     "buttons next to a column explain it.", "About these numbers")
 

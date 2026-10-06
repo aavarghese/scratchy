@@ -567,6 +567,9 @@ diff-view-element::part(character-diff--deleted) { background: color-mix(in srgb
 .key.s2, .lkey.s2 { background: var(--s2); }
 .key.s3, .lkey.s3 { background: var(--s3); }
 .lkey.prev { background: var(--muted); opacity: 0.7; }
+/* Engines other than scratchy share one neutral row marker: with up to eight of
+ * them, colour cannot carry identity, so the row's own label does. */
+.key.s0 { background: var(--muted); }
 
 /* Before/after badge under a scratchy number: the arrow carries better/worse
  * in Carbon's support colours; the figure itself stays in text ink. */
@@ -580,6 +583,10 @@ diff-view-element::part(character-diff--deleted) { background: color-mix(in srgb
 .legend { display: flex; gap: 1.25rem; font-size: var(--cds-label-01-font-size, 0.75rem); color: var(--fg); margin-bottom: 0.25rem; }
 .chartrow { display: flex; flex-wrap: wrap; gap: 1.5rem 2.5rem; }
 .chartpane { flex: 1 1 22rem; max-width: 34rem; min-width: 0; }
+/* Small multiples: one compact chart per engine, its two-line legend above it. */
+.chartrow:has(> .mini) { gap: 1rem 1.25rem; margin-bottom: 1rem; }
+.chartpane.mini { flex: 1 1 11.5rem; max-width: 15rem; }
+.chartpane.mini .minititle { font-size: var(--cds-label-01-font-size, 0.75rem); font-weight: 600; margin-bottom: 0.1rem; }
 .mchart { width: 100%; height: auto; display: block; overflow: visible; }
 .mchart .grid { stroke: var(--line); stroke-width: 1; }
 .mchart .tick { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
@@ -605,6 +612,14 @@ diff-view-element::part(character-diff--deleted) { background: color-mix(in srgb
 .heat table { border-collapse: separate; border-spacing: 2px; font-size: var(--cds-body-01-font-size, 0.875rem); }
 .heat th { color: var(--muted); font-weight: 600; padding: 0.25rem 0.5rem; text-align: right; }
 .heat td { background: var(--heat-mid); color: var(--fg); padding: 0.4rem 0.6rem; min-width: 6.5rem; text-align: right; font-variant-numeric: tabular-nums; border-radius: 2px; }
+/* Dense heat maps: every engine a row, the cells small, a gap between prompt sizes. */
+.dheat { margin-bottom: 1rem; }
+.dheat td { min-width: 2.9rem; padding: 0.3rem 0.35rem; text-align: center; font-size: var(--cds-label-01-font-size, 0.75rem); }
+.dheat th[scope="row"] { text-align: left; white-space: nowrap; padding-right: 0.75rem; }
+.dheat th.grp { text-align: center; border-bottom: 1px solid var(--line); }
+.dheat th { font-size: var(--cds-label-01-font-size, 0.75rem); padding: 0.2rem 0.35rem; text-align: center; }
+.dheat .grp0 { border-left: 0.6rem solid transparent; background-clip: padding-box; }
+.dheat td.own { background: none; color: var(--fg); font-weight: 600; }
 .heat td b { display: block; font-size: 1rem; }
 /* Text ink, not muted grey: on a strong tint grey loses its contrast. */
 .heat td span { display: block; color: inherit; font-size: var(--cds-label-01-font-size, 0.75rem); }
