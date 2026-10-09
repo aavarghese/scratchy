@@ -211,12 +211,39 @@ def untimed_note(c):
     return f"{untimed(c)} of {c.get('completed', '?')} untimed"
 
 
+FAILED = "‡"
+
+
+def failed(c):
+    """Requests in a cell that errored or timed out (bench serve's `failed`;
+    absent, so 0, in runs made before it existed). Every number in the cell
+    then covers only the requests that completed."""
+    return (c or {}).get("failed") or 0
+
+
+def failed_note(c):
+    return f"{failed(c)} of {failed(c) + (c.get('completed') or 0)} requests failed"
+
+
+def mark(c, metric):
+    """The marks a cell's value carries: † for a timing taken from only some
+    of its requests, ‡ for any number from a cell where requests failed."""
+    return (PARTIAL if partial(c, metric) else "") + (FAILED if failed(c) else "")
+
+
+def note(c, metric):
+    """The hover text for a cell's marks, or ""."""
+    parts = ([untimed_note(c)] if partial(c, metric) else []) + ([failed_note(c)] if failed(c) else [])
+    return "; ".join(parts)
+
+
 def cfmt(c, metric, nd=0):
     """A cell's value as text: says "no stream" rather than show a timing the
-    engine never produced, and marks one taken from only some requests."""
+    engine never produced, and marks one taken from only some requests, or
+    from a cell where requests failed."""
     if c and metric in TIMINGS and not streamed(c):
-        return NO_STREAM
-    return fmt(timing(c, metric), nd) + (PARTIAL if partial(c, metric) else "")
+        return NO_STREAM + (FAILED if failed(c) else "")
+    return fmt(timing(c, metric), nd) + mark(c, metric)
 
 
 def nice_max(v):
@@ -299,7 +326,9 @@ STARTUP_INFO = info(
 TIMING_INFO = info(
     "<b>no stream</b>: the answer arrived in one piece, so TTFT and TPOT could not be "
     "timed. <b>†</b>: some answers did; the timing comes from the rest (hover for how "
-    "many). mlx-lm and ollama can stop answers early, which flatters tok/s.")
+    "many). <b>‡</b>: some requests failed (an error or a timeout, usually the engine "
+    "running out of memory), so every number in that cell covers only the rest. "
+    "mlx-lm and ollama can stop answers early, which flatters tok/s.")
 RSS_INFO = info("The server process at its peak. For ollama, <code>ollama serve</code> "
                 "only; its runner process is not counted.")
 USERS_INFO = info("Requests in flight at once. An engine may batch fewer than it is offered.")
@@ -381,7 +410,7 @@ def summary_table(m, run, prev=None):
             lfmt(ladder, "warm", "ttft_from_send_s", 0, 1000),
             cfmt(one, "median_ttft_ms"),
             cfmt(one, "median_tpot_ms", 1),
-            fmt(timing(one, "output_throughput"), 1),
+            fmt(timing(one, "output_throughput"), 1) + (FAILED if failed(one) else ""),
             fmt(med(ladder, "cold", "peak_rss_mib")),
         ]
         badges = [""] * len(vals)
@@ -429,7 +458,7 @@ def line_svg(series, xs, cid, ylabel, nd, title, head, xlabel, notes=None):
     being swept (users, or prompt tokens), one line per series. A point that was
     not measured (None) leaves a gap in its line rather than a bridge. Its
     legend sits above it, so it carries no end labels and stays narrow.
-    `notes` maps (series label, x) to a suffix for that point's tooltip."""
+    `notes` maps (series label, x) to (mark, note) for that point's tooltip."""
     notes = notes or {}
     W, H, L, R, T, B = 300, 190, 44, 14, 10, 36
     pw, ph = W - L - R, H - T - B
@@ -477,8 +506,8 @@ def line_svg(series, xs, cid, ylabel, nd, title, head, xlabel, notes=None):
         for label, cls, at in by_x:
             # A point present but None was not measured (no stream); absent is "—".
             value = NO_STREAM if x in at and at[x] is None else fmt(at.get(x), nd)
-            note = notes.get((label, x))
-            rows.append([value + (PARTIAL if note else ""), label + (f" ({note})" if note else ""), cls])
+            m, note = notes.get((label, x), ("", ""))
+            rows.append([value + m, label + (f" ({note})" if note else ""), cls])
         out.append(f'<rect class="hit" x="{left:.1f}" y="{T}" width="{right - left:.1f}" height="{ph}" '
                    f'tabindex="0" data-x="{xpos[x]:.1f}" data-head="{short(x)} {esc(head)}" '
                    f'data-tip="{tip(rows)}"><title>{short(x)}</title></rect>')
@@ -537,8 +566,9 @@ def sweep_charts(m, mid, axis, base, run, prev=None):
             series = [x for x in series if any(v is not None for _, v in x[2])]
             if not any(lbl == "scratchy" for lbl, _c, _p in series):
                 continue
-            marks = {(lab, x): untimed_note(cs[x]) for lab, cs in (("scratchy", mine), (label, theirs))
-                     if lab for x in cs if partial(cs[x], metric)}
+            marks = {(lab, x): (mark(cs[x], metric), note(cs[x], metric))
+                     for lab, cs in (("scratchy", mine), (label, theirs))
+                     if lab for x in cs if note(cs[x], metric)}
             gone = key and label not in {lbl for lbl, _c, _p in series}
             name = (f"vs {esc(label)}" + (f' <span class="dim">({NO_STREAM})</span>' if gone else "")
                     if key else "scratchy")
@@ -652,8 +682,8 @@ def grid_maps(m, run):
                     rung = f"{i}x{o}"
                     cs, cr = mine.get(rung), have[k].get(rung)
                     r = faster(timing(cs, metric), timing(cr, metric))
-                    mark = PARTIAL if partial(cs, metric) or partial(cr, metric) else ""
-                    text = (f"{r:.2f}{mark}" if r is not None
+                    m = "".join(dict.fromkeys(mark(cs, metric) + mark(cr, metric)))
+                    text = (f"{r:.2f}{m}" if r is not None
                             else NO_STREAM if cr and timing(cr, metric) is None else "—")
                     rows = [[cfmt(cs, metric, nd), "scratchy", "s1"], [cfmt(cr, metric, nd), LABEL[k], "s2"]]
                     tds.append(f'<td class="{heat_class(r)}{" grp0" if j == 0 else ""}" tabindex="0" '
@@ -822,10 +852,10 @@ def glance(machines):
                 rung = f"{i}x{o}"
                 cs, cr = have["scratchy"].get(rung), have[rival].get(rung)
                 r = faster(timing(cs, metric), timing(cr, metric))
-                mark = PARTIAL if partial(cs, metric) or partial(cr, metric) else ""
+                m = "".join(dict.fromkeys(mark(cs, metric) + mark(cr, metric)))
                 if r is not None:
                     ratios.append(r)
-                value = f"×{r:.2f}{mark}" if r is not None else "no comparison"
+                value = f"×{r:.2f}{m}" if r is not None else "no comparison"
                 # A square with nothing to compare is hollow, so it never reads
                 # as "about the same".
                 squares.append(f'<span class="gsq {heat_class(r) or "gnil"}" data-head="{esc(chip)} · {esc(stem)} · {i} in × {o} out" '
