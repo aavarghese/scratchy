@@ -444,73 +444,76 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
     // so that request is timed as a full cache hit on an engine that has one
     // (scratchy does; #344) and as a cold prefill on one that does not.
     let unmeasured = 1 + args.num_warmups;
-    let (prompt_entries, warm_entries): (Vec<PromptEntry>, Vec<PromptEntry>) = match args
-        .dataset_name
-        .as_str()
-    {
-        "sharegpt" => {
-            let dataset_path = args.dataset_path.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("--dataset-path is required for sharegpt dataset")
-            })?;
-            eprintln!("Loading ShareGPT dataset from {dataset_path}...");
-            // Shuffled, then truncated: the first num_prompts are the same
-            // whether or not the extras are loaded, so the extras warm up.
-            let samples = datasets::load_sharegpt(
-                Path::new(dataset_path),
-                &tokenizer,
-                args.num_prompts + unmeasured,
-                None,
-                args.seed,
-            )?;
-            let mut entries: Vec<PromptEntry> = samples
-                .into_iter()
-                .map(|s| PromptEntry {
-                    text: s.prompt,
-                    output_len: s.expected_output_len,
-                })
-                .collect();
-            let n = entries.len().min(args.num_prompts);
-            let warm = entries.split_off(n);
-            anyhow::ensure!(
-                !warm.is_empty(),
-                "the ShareGPT dataset has no samples left after the {n} measured ones to warm up with"
-            );
-            eprintln!(
-                "Loaded {n} samples from ShareGPT dataset (+{} to warm up)",
-                warm.len()
-            );
-            (entries, warm)
-        }
-        _ => {
-            eprintln!(
-                "Generating {} random prompts (matching Python RandomDataset)...",
-                args.num_prompts
-            );
-            let random = |n, seed| -> Result<Vec<PromptEntry>> {
-                Ok(datasets::generate_random(
-                    &tokenizer,
-                    n,
-                    args.input_len,
-                    args.output_len,
-                    args.random_range_ratio,
-                    args.random_prefix_len,
-                    seed,
-                )?
-                .into_iter()
-                .map(|s| PromptEntry {
-                    text: s.prompt,
-                    output_len: s.expected_output_len,
-                })
-                .collect())
-            };
-            // Same lengths, another seed: the measured prompts are exactly
-            // what this seed always produced, and none of them is replayed.
-            (
-                random(args.num_prompts, args.seed)?,
-                random(unmeasured, args.seed ^ WARMUP_SEED_XOR)?,
-            )
-        }
+    let random = |n, seed| -> Result<Vec<PromptEntry>> {
+        Ok(datasets::generate_random(
+            &tokenizer,
+            n,
+            args.input_len,
+            args.output_len,
+            args.random_range_ratio,
+            args.random_prefix_len,
+            seed,
+        )?
+        .into_iter()
+        .map(|s| PromptEntry {
+            text: s.prompt,
+            output_len: s.expected_output_len,
+        })
+        .collect())
     };
+    let (prompt_entries, warm_entries): (Vec<PromptEntry>, Vec<PromptEntry>) =
+        match args.dataset_name.as_str() {
+            "sharegpt" => {
+                let dataset_path = args.dataset_path.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("--dataset-path is required for sharegpt dataset")
+                })?;
+                eprintln!("Loading ShareGPT dataset from {dataset_path}...");
+                // Shuffled, then truncated: the first num_prompts are the same
+                // whether or not the extras are loaded, so the extras warm up.
+                let samples = datasets::load_sharegpt(
+                    Path::new(dataset_path),
+                    &tokenizer,
+                    args.num_prompts + unmeasured,
+                    None,
+                    args.seed,
+                )?;
+                let mut entries: Vec<PromptEntry> = samples
+                    .into_iter()
+                    .map(|s| PromptEntry {
+                        text: s.prompt,
+                        output_len: s.expected_output_len,
+                    })
+                    .collect();
+                let n = entries.len().min(args.num_prompts);
+                let mut warm = entries.split_off(n);
+                if warm.is_empty() {
+                    // A dataset no bigger than the measured set still runs, as it
+                    // did before: its warmups are random prompts instead.
+                    warm = random(unmeasured, args.seed ^ WARMUP_SEED_XOR)?;
+                    eprintln!(
+                        "Loaded {n} samples from ShareGPT dataset (none left over; random warmups)"
+                    );
+                } else {
+                    eprintln!(
+                        "Loaded {n} samples from ShareGPT dataset (+{} to warm up)",
+                        warm.len()
+                    );
+                }
+                (entries, warm)
+            }
+            _ => {
+                eprintln!(
+                    "Generating {} random prompts (matching Python RandomDataset)...",
+                    args.num_prompts
+                );
+                // Same lengths, another seed: the measured prompts are exactly
+                // what this seed always produced, and none of them is replayed.
+                (
+                    random(args.num_prompts, args.seed)?,
+                    random(unmeasured, args.seed ^ WARMUP_SEED_XOR)?,
+                )
+            }
+        };
 
     let num_prompts = prompt_entries.len();
 
