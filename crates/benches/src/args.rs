@@ -449,6 +449,12 @@ pub struct BenchServeArgs {
     #[arg(long)]
     pub save_result: bool,
 
+    /// Also write every request's own timings to the results JSON (`requests`), in the order
+    /// sent: its start, time to first token, end-to-end latency, output tokens, and whether it
+    /// completed. Lets a reader take the medians over any subset, a cell's first rounds say.
+    #[arg(long)]
+    pub save_detailed: bool,
+
     /// Directory to save results in (used with --save-result).
     #[arg(long)]
     pub result_dir: Option<String>,

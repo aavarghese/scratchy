@@ -665,6 +665,23 @@ fn run_bench_serve_blocking(args: BenchServeArgs) -> Result<()> {
         }
     }
 
+    if args.save_detailed {
+        let mut sent: Vec<&RequestResult> = run.results.iter().collect();
+        sent.sort_by(|a, b| a.start_time.total_cmp(&b.start_time));
+        let requests = (sent.iter())
+            .map(|r| {
+                serde_json::json!({
+                    "start_s": r.start_time,
+                    "ttft_ms": r.success.then_some(r.ttft * 1000.0),
+                    "e2el_ms": r.e2el * 1000.0,
+                    "output_tokens": r.output_tokens,
+                    "success": r.success,
+                })
+            })
+            .collect::<Vec<_>>();
+        obj.insert("requests".into(), serde_json::Value::Array(requests));
+    }
+
     write_results(&args, &model, &json)
 }
 
